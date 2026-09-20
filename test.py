@@ -100,7 +100,7 @@ def add_player(conn, name):
         next_player_id += 1
 
         players[player_id] = {
-            "Name": name
+            "Name": name, "Room" : "Common"  #change the common
         }
 
         connections[player_id] = conn
@@ -130,6 +130,62 @@ def remove_player(player_id):
 # ============================================================
 # GAME LOGIC
 # ============================================================
+
+#function to move rooms
+def switch_rooms(player_id, message,name):
+    valid_rooms = ["Common","GPU","CyberSec","Web Dev"]
+    room=message.get('Message')
+    
+    if room not in valid_rooms:
+        send_message(
+            connections[player_id],
+            {
+                "Type": "Chat","Player":name,
+                "Message": "Not a valid room brochacho"
+            }
+        )
+        return 0
+
+    player = players.get(player_id)
+
+    current_room = player["Room"]
+
+    if current_room == room:
+        send_message(
+            connections[player_id],
+            {
+                "Type": "Chat",
+                "Player": name,
+                "Message": f"You are already in {room}."
+            }
+        )
+        return 0
+
+    player["Room"] = room
+
+    send_message(
+        connections[player_id],
+        {
+            "Type": "Chat",
+            "Player": name,
+            "Message": f"You moved from {current_room} to {room}."
+        }
+    )
+
+    return 1
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def process_message(player_id, message):
 
@@ -169,6 +225,13 @@ def process_message(player_id, message):
         )
 
         # Put your actual chat-game logic here later.
+
+                    
+    # Room Movement 
+    elif message_type=="Move":
+        switch_rooms(player_id,message,name)  #add common room as default for every player 
+
+
 
 # ============================================================
 # PLAYER CONNECTION HANDLER
@@ -673,6 +736,15 @@ def send_whisper(conn, message):
         }
     )
 
+def send_move_message(conn,message):
+    send_message(   
+            conn,
+            {
+                "Type": "Move",
+                "Message": message
+            }
+        )
+
 # ============================================================
 # CLIENT GAME LOOP
 # ============================================================
@@ -692,6 +764,14 @@ def client_game_loop(conn):
 
         if '/vote' in message:
             pass
+        elif '/move' == message:
+            room_name = input(
+                "Enter the folder you want to move into: "
+            ).strip()
+
+
+            send_move_message(conn,room_name)
+
         else:
             send_chat(
             conn,
