@@ -79,8 +79,8 @@ def kill_minigame():
 
         os.system("clear")
 
-        print("=== KILL ===")
-        print()
+    print("=== KILL ===")
+    print()
         print(message)
 
         time.sleep(1)
@@ -96,11 +96,14 @@ def kill_minigame():
     print(f"PRESS [{key_name}] NOW!")
 
     # Fixed response time
-    time_limit = 1.5
+    time_limit = 2.0
 
     pressed_key = get_key(time_limit)
 
     os.system("clear")
+
+    print("=== KILL ===")
+    print()
 
     if pressed_key == correct_key:
 
