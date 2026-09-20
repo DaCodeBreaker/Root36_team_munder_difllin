@@ -102,9 +102,6 @@ def kill_minigame():
 
     os.system("clear")
 
-    print("=== KILL ===")
-    print()
-
     if pressed_key == correct_key:
 
         print("=== KILL SUCCESS ===")
