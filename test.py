@@ -1015,15 +1015,44 @@ def client_game_loop(conn):
         if message.strip() == "":
             continue
 
-        if '/vote' in message:
-            pass
-        elif '/move' == message:
+        if message.startswith("/vote"):
+            # Add voting system here later
+            print(
+                "Voting system not implemented yet."
+            )
+
+        # ====================================================
+        # WHISPER
+        # ====================================================
+
+        elif message == "/whisper":
+            target_name = input(
+                "Enter the player name: "
+            ).strip()
+
+            whisper_message = input(
+                f">(Whisper to {target_name}) "
+            )
+
+            send_whisper(
+                conn,
+                whisper_message,
+                target_name
+            )
+
+        # ====================================================
+        # ROOM MOVEMENT
+        # ====================================================
+
+        elif message == "/move":
             room_name = input(
                 "Enter the folder you want to move into: "
             ).strip()
 
-
-            send_move_message(conn,room_name)
+            send_move_message(
+                conn,
+                room_name
+            )
 
         else:
 
