@@ -29,6 +29,12 @@ send_lock = threading.Lock()
 # This is NOT set until the host types "start game"
 game_started = threading.Event()
 
+# Stores leftover TCP data for each connection
+recv_buffers = {}
+
+# Protects recv_buffers
+recv_lock = threading.Lock()
+
 
 # ============================================================
 # MESSAGE FUNCTIONS
@@ -37,6 +43,7 @@ game_started = threading.Event()
 def send_message(conn, message):
     """
     Send one JSON message over TCP.
+
     A newline marks the end of the message.
     """
 
@@ -48,23 +55,32 @@ def send_message(conn, message):
 
 def receive_message(conn):
     """
-    Receive one complete JSON message.
+    Receive exactly one JSON message.
 
-    TCP is a stream, so we use newline as our
-    message separator.
+    TCP is a stream, so one recv() does not necessarily
+    equal one send(). We use newline as the message separator
+    and keep leftover data for the next call.
     """
 
-    data = b""
+    with recv_lock:
+        data = recv_buffers.get(conn, b"")
 
     while b"\n" not in data:
+
         chunk = conn.recv(4096)
 
         if not chunk:
+            with recv_lock:
+                recv_buffers.pop(conn, None)
+
             return None
 
         data += chunk
 
-    line, _ = data.split(b"\n", 1)
+    line, remaining = data.split(b"\n", 1)
+
+    with recv_lock:
+        recv_buffers[conn] = remaining
 
     return json.loads(line.decode())
 
@@ -116,7 +132,14 @@ def remove_player(player_id):
         conn = connections.pop(player_id, None)
 
     if conn:
-        conn.close()
+
+        with recv_lock:
+            recv_buffers.pop(conn, None)
+
+        try:
+            conn.close()
+        except OSError:
+            pass
 
     if player:
 
@@ -125,6 +148,18 @@ def remove_player(player_id):
             "Player": player["Name"],
             "Message": f'{player["Name"]} left the game.'
         })
+
+
+def find_player_id_by_name(name):
+
+    with lock:
+
+        for player_id, player in players.items():
+
+            if player["Name"] == name:
+                return player_id
+
+    return None
 
 
 # ============================================================
@@ -214,7 +249,69 @@ def process_message(player_id, message):
 
 
     # --------------------------------------------------------
-    # Voting
+    # WHISPER
+    # --------------------------------------------------------
+
+    elif message_type == "Whisper":
+
+        target_name = message.get("Player")
+
+        target_id = find_player_id_by_name(target_name)
+
+        if target_id is None:
+
+            # Tell the sender that the player doesn't exist
+            with lock:
+                sender_conn = connections.get(player_id)
+
+            if sender_conn is not None:
+
+                send_message(
+                    sender_conn,
+                    {
+                        "Type": "Error",
+                        "Message": f"Player '{target_name}' doesn't exist."
+                    }
+                )
+
+            return
+
+
+        # Get the TARGET player's socket
+        with lock:
+            target_conn = connections.get(target_id)
+
+
+        if target_conn is not None:
+
+            send_message(
+                target_conn,
+                {
+                    "Type": "Whisper",
+                    "Player": name,
+                    "Message": message.get("Message", "")
+                }
+            )
+
+
+        # Also tell sender that whisper was sent
+        with lock:
+            sender_conn = connections.get(player_id)
+
+        if sender_conn is not None:
+
+            send_message(
+                sender_conn,
+                {
+                    "Type": "WhisperSent",
+                    "Player": target_name,
+                    "Message": message.get("Message", "")
+                }
+            )
+
+
+    # --------------------------------------------------------
+    # VOTE
     # --------------------------------------------------------
 
     elif message_type == "Vote":
@@ -224,7 +321,8 @@ def process_message(player_id, message):
             message
         )
 
-        # Put your actual chat-game logic here later.
+        # Put your actual voting logic here later.
+
 
                     
     # Room Movement 
@@ -250,15 +348,22 @@ def handle_player(conn, addr):
         player_info = receive_message(conn)
 
         if player_info is None:
+
             conn.close()
             return
 
+
         name = player_info["Name"]
 
-        player_id = add_player(conn, name)
+        player_id = add_player(
+            conn,
+            name
+        )
+
 
         print()
         print(f"{name} connected from {addr}")
+
 
         # Tell everyone that this player joined
         broadcast({
@@ -272,7 +377,9 @@ def handle_player(conn, addr):
         # WAIT FOR HOST TO START GAME
         # ====================================================
 
-        print(f"{name} is waiting for the game to start...")
+        print(
+            f"{name} is waiting for the game to start..."
+        )
 
         game_started.wait()
 
@@ -281,12 +388,18 @@ def handle_player(conn, addr):
         # GAME HAS STARTED
         # ====================================================
 
-        print(f"{name} is now listening for game messages.")
+        print(
+            f"{name} is now listening for game messages."
+        )
 
-        # Tell this player the game has started
-        send_message(conn, {
-            "Type": "GameStart"
-        })
+
+        # Tell this player that the game started
+        send_message(
+            conn,
+            {
+                "Type": "GameStart"
+            }
+        )
 
 
         # ====================================================
@@ -300,9 +413,11 @@ def handle_player(conn, addr):
             if message is None:
                 break
 
+
             print(
                 f"{name} -> {message}"
             )
+
 
             process_message(
                 player_id,
@@ -310,7 +425,11 @@ def handle_player(conn, addr):
             )
 
 
-    except (ConnectionError, json.JSONDecodeError, KeyError) as e:
+    except (
+        ConnectionError,
+        json.JSONDecodeError,
+        KeyError
+    ) as e:
 
         print(
             f"Connection error with {addr}:",
@@ -321,14 +440,17 @@ def handle_player(conn, addr):
     finally:
 
         if player_id is not None:
-            remove_player(player_id)
+
+            remove_player(
+                player_id
+            )
 
 
 # ============================================================
 # ACCEPT PLAYERS
 # ============================================================
 
-def accept_players(server):
+def accept_players(server, max_players):
 
     while True:
 
@@ -337,6 +459,38 @@ def accept_players(server):
             conn, addr = server.accept()
 
 
+            # -----------------------------------------------
+            # Check player limit
+            # -----------------------------------------------
+
+            with lock:
+                current_players = len(players)
+
+
+            if current_players >= max_players:
+
+                print(
+                    f"Rejected connection from {addr}: "
+                    "game is full."
+                )
+
+                send_message(
+                    conn,
+                    {
+                        "Type": "Error",
+                        "Message": "Game is full."
+                    }
+                )
+
+                conn.close()
+
+                continue
+
+
+            # -----------------------------------------------
+            # Start player thread
+            # -----------------------------------------------
+
             thread = threading.Thread(
                 target=handle_player,
                 args=(conn, addr),
@@ -344,6 +498,7 @@ def accept_players(server):
             )
 
             thread.start()
+
 
         except OSError:
 
@@ -367,6 +522,7 @@ def discovery_loop(discovery, game_id):
 
             if requested_game == game_id:
 
+                # Send TCP port back to client
                 discovery.sendto(
                     str(TCP_PORT).encode(),
                     addr
@@ -384,10 +540,15 @@ def discovery_loop(discovery, game_id):
 
 def host_game(name):
 
-    game_id = input("Enter Game ID: ").strip()
+    game_id = input(
+        "Enter Game ID: "
+    ).strip()
+
 
     max_players = int(
-        input("Enter maximum players: ")
+        input(
+            "Enter maximum players: "
+        )
     )
 
 
@@ -400,17 +561,22 @@ def host_game(name):
         socket.SOCK_STREAM
     )
 
+
     server.setsockopt(
         socket.SOL_SOCKET,
         socket.SO_REUSEADDR,
         1
     )
 
+
     server.bind(
         ("0.0.0.0", TCP_PORT)
     )
 
-    server.listen(max_players)
+
+    server.listen(
+        max_players
+    )
 
 
     # ========================================================
@@ -422,11 +588,13 @@ def host_game(name):
         socket.SOCK_DGRAM
     )
 
+
     discovery.setsockopt(
         socket.SOL_SOCKET,
         socket.SO_REUSEADDR,
         1
     )
+
 
     discovery.bind(
         ("0.0.0.0", DISCOVERY_PORT)
@@ -450,17 +618,27 @@ def host_game(name):
 
     threading.Thread(
         target=accept_players,
-        args=(server,),
+        args=(server, max_players),
         daemon=True
     ).start()
 
+
+    # ========================================================
+    # DISPLAY LOBBY
+    # ========================================================
 
     print()
     print("================================")
     print("             LOBBY")
     print("================================")
-    print("Game ID:", game_id)
-    print("Maximum players:", max_players)
+    print(
+        "Game ID:",
+        game_id
+    )
+    print(
+        "Maximum players:",
+        max_players
+    )
     print()
     print("Waiting for players...")
     print()
@@ -474,6 +652,7 @@ def host_game(name):
         socket.AF_INET,
         socket.SOCK_STREAM
     )
+
 
     host_connection.connect(
         ("127.0.0.1", TCP_PORT)
@@ -490,7 +669,10 @@ def host_game(name):
     )
 
 
-    # Host receives messages from server
+    # ========================================================
+    # HOST RECEIVES SERVER MESSAGES
+    # ========================================================
+
     threading.Thread(
         target=client_receive_loop,
         args=(host_connection,),
@@ -506,6 +688,7 @@ def host_game(name):
 
         command = input("> ").strip().lower()
 
+
         if command == "start game":
 
             print()
@@ -514,11 +697,13 @@ def host_game(name):
             print("================================")
             print()
 
-            # This releases every handle_player()
-            # that is currently waiting.
+
+            # Releases every handle_player()
+            # currently waiting.
             game_started.set()
 
             break
+
 
         else:
 
@@ -547,11 +732,13 @@ def join_game(game_id):
         socket.SOCK_DGRAM
     )
 
+
     discovery.setsockopt(
         socket.SOL_SOCKET,
         socket.SO_BROADCAST,
         1
     )
+
 
     discovery.settimeout(3)
 
@@ -563,7 +750,10 @@ def join_game(game_id):
     )
 
 
-    # Broadcast Game ID
+    # ========================================================
+    # BROADCAST GAME ID
+    # ========================================================
+
     discovery.sendto(
         game_id.encode(),
         ("<broadcast>", DISCOVERY_PORT)
@@ -576,6 +766,7 @@ def join_game(game_id):
             1024
         )
 
+
     except socket.timeout:
 
         print()
@@ -586,8 +777,13 @@ def join_game(game_id):
         return None
 
 
-    # IP comes from the UDP sender
+    # ========================================================
+    # GET HOST ADDRESS
+    # ========================================================
+
+    # The IP address comes from the UDP sender
     host_ip = host_addr[0]
+
 
     host_port = int(
         port_data.decode()
@@ -605,6 +801,7 @@ def join_game(game_id):
         socket.AF_INET,
         socket.SOCK_STREAM
     )
+
 
     client.connect(
         (host_ip, host_port)
@@ -631,12 +828,15 @@ def client_receive_loop(conn):
 
             message = receive_message(conn)
 
+
             if message is None:
                 break
+
 
             handle_server_message(
                 message
             )
+
 
         except (
             ConnectionError,
@@ -703,7 +903,42 @@ def handle_server_message(message):
 
 
     # --------------------------------------------------------
-    # VOTIING
+    # WHISPER RECEIVED
+    # --------------------------------------------------------
+
+    elif message_type == "Whisper":
+
+        print(
+            f'[Whisper from {message["Player"]}] '
+            f'{message["Message"]}'
+        )
+
+
+    # --------------------------------------------------------
+    # WHISPER SENT
+    # --------------------------------------------------------
+
+    elif message_type == "WhisperSent":
+
+        print(
+            f'[Whisper to {message["Player"]}] '
+            f'{message["Message"]}'
+        )
+
+
+    # --------------------------------------------------------
+    # ERROR
+    # --------------------------------------------------------
+
+    elif message_type == "Error":
+
+        print(
+            f'[ERROR] {message["Message"]}'
+        )
+
+
+    # --------------------------------------------------------
+    # VOTING
     # --------------------------------------------------------
 
     elif message_type == "Vote":
@@ -727,12 +962,20 @@ def send_chat(conn, message):
             "Message": message
         }
     )
-def send_whisper(conn, message):
-    send_message(   
+
+
+# ============================================================
+# SEND WHISPER
+# ============================================================
+
+def send_whisper(conn, message, target_name):
+
+    send_message(
         conn,
         {
-            "Type": "Chat",
-            "Message": message
+            "Type": "Whisper",
+            "Message": message,
+            "Player": target_name
         }
     )
 
@@ -755,9 +998,19 @@ def client_game_loop(conn):
 
         message = input("> ")
 
+
+        # ====================================================
+        # QUIT
+        # ====================================================
+
         if message == "/quit":
+
             break
 
+
+        # ====================================================
+        # IGNORE EMPTY MESSAGE
+        # ====================================================
 
         if message.strip() == "":
             continue
@@ -773,13 +1026,17 @@ def client_game_loop(conn):
             send_move_message(conn,room_name)
 
         else:
+
             send_chat(
-            conn,
-            message
-        )
+                conn,
+                message
+            )
 
 
-    conn.close()
+    try:
+        conn.close()
+    except OSError:
+        pass
 
 
 # ============================================================
@@ -813,7 +1070,7 @@ def client_game(conn, name):
 
 
     # ========================================================
-    # WAIT FOR GAME START
+    # CLIENT INPUT
     # ========================================================
 
     client_game_loop(
@@ -843,7 +1100,9 @@ def main():
 
     if choice == "host":
 
-        host_game(name)
+        host_game(
+            name
+        )
 
 
     # ========================================================
