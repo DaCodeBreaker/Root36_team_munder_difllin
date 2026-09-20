@@ -24,7 +24,6 @@ DISCOVERY_PORT = 5051
 # ============================================================
 
 DAY_DURATION = 120        # seconds
-NIGHT_DURATION = 30       # seconds
 DISCUSSION_DURATION = 45  # seconds
 VOTING_DURATION = 20      # seconds
 TASKS_PER_DAY = 2
@@ -1408,6 +1407,11 @@ def run_game_loop():
         # DAY PHASE
         # ====================================================
 
+        # Reset day actions
+        with game_lock:
+            night_actions_done["virus_kill"] = False
+            night_actions_done["detective_inspect"] = False
+            night_actions_done["antivirus_revive"] = False
         day_number += 1
         current_phase = "Day"
         day_early_end.clear()
