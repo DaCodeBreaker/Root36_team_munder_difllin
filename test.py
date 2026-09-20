@@ -10,7 +10,7 @@ from datetime import datetime
 # CONFIG
 # ============================================================
 
-TCP_PORT = 5000
+TCP_PORT = 5050
 DISCOVERY_PORT = 5001
 
 
@@ -19,7 +19,6 @@ DISCOVERY_PORT = 5001
 # ============================================================
 
 DAY_DURATION = 120         # seconds
-NIGHT_DURATION = 30       # seconds
 DISCUSSION_DURATION = 45  # seconds
 VOTING_DURATION = 20      # seconds
 TASKS_PER_DAY = 2
@@ -568,7 +567,7 @@ def handle_kill(player_id, message):
         name = player["Name"]
 
     # Validations
-    if current_phase != "Night":
+    if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
             "Message": "You can only kill during the night."
@@ -696,7 +695,7 @@ def handle_inspect(player_id, message):
             return
 
     # Validations
-    if current_phase != "Night":
+    if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
             "Message": "You can only inspect during the night."
@@ -760,7 +759,7 @@ def handle_revive(player_id, message):
             return
 
     # Validations
-    if current_phase != "Night":
+    if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
             "Message": "You can only revive during the night."
@@ -858,7 +857,7 @@ def handle_tamper(player_id, message):
             return
 
     # Validations
-    if current_phase != "Night":
+    if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
             "Message": "You can only tamper during the night."
@@ -1002,7 +1001,7 @@ def handle_sabotage(player_id, message):
     bad_roles = {"Virus", "Rootkit"}
 
     # Validations
-    if current_phase != "Night":
+    if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
             "Message": "You can only sabotage during the night."
@@ -1271,6 +1270,11 @@ def run_game_loop():
         # DAY PHASE
         # ====================================================
 
+        # Reset day actions
+        with game_lock:
+            night_actions_done["virus_kill"] = False
+            night_actions_done["detective_inspect"] = False
+            night_actions_done["antivirus_revive"] = False
         day_number += 1
         current_phase = "Day"
         day_early_end.clear()
@@ -1316,24 +1320,7 @@ def run_game_loop():
         if current_phase == "GameOver":
             break
 
-        # ====================================================
-        # NIGHT PHASE
-        # ====================================================
 
-        current_phase = "Night"
-
-        # Reset night actions
-        with game_lock:
-            night_actions_done["virus_kill"] = False
-            night_actions_done["detective_inspect"] = False
-            night_actions_done["antivirus_revive"] = False
-
-        broadcast({
-            "Type": "PhaseChange",
-            "Phase": "Night",
-            "DayNumber": day_number,
-            "Duration": NIGHT_DURATION,
-        })
 
         # Leak dead player audit logs
         with game_lock:
@@ -1353,12 +1340,7 @@ def run_game_loop():
                     "Log": log,
                 })
 
-        print(f"[SERVER] === NIGHT {day_number} === ({NIGHT_DURATION}s)")
 
-        time.sleep(NIGHT_DURATION)
-
-        if current_phase == "GameOver":
-            break
 
         # Clear sabotage targets after the night they're active
         with game_lock:
