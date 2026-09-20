@@ -85,6 +85,9 @@ night_actions_done = {
 # Players who died this cycle (for audit leak next night)
 recently_dead = []
 
+# Cooldown for Virus kill
+last_kill_time = 0
+
 # Room -> minigame mapping
 ROOM_TASKS = {
     "GPU": "memory",
@@ -108,6 +111,9 @@ client_conn = None
 
 # The client's own role (set when RoleAssign message received)
 client_role = None
+
+# The client's own name
+client_name = ""
 
 # The client's own alive status
 client_alive = True
@@ -309,10 +315,10 @@ def assign_roles():
     num_players = len(player_ids)
     random.shuffle(player_ids)
 
-    roles = ["Virus", "Rootkit", "Detective"]
+    roles = ["Virus", "Detective"]
 
-    if num_players >= 5:
-        roles.append("Antivirus")
+    if num_players > 5:
+        roles.extend(["Rootkit", "Antivirus"])
 
     # Fill remaining with Process
     while len(roles) < num_players:
@@ -555,22 +561,22 @@ def handle_task_result(player_id, message):
 
 def handle_kill(player_id, message):
     """Handle Virus kill attempt."""
+    global last_kill_time
 
     target_name = message.get("Target", "")
 
     with lock:
         player = players.get(player_id)
-
         if player is None:
             return
-
         name = player["Name"]
+        room = player["Room"]
 
     # Validations
     if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
-            "Message": "You can only kill during the night."
+            "Message": "You can only kill during the Day."
         })
         return
 
@@ -589,10 +595,12 @@ def handle_kill(player_id, message):
         return
 
     with game_lock:
-        if night_actions_done["virus_kill"]:
+        current_time = time.time()
+        if current_time - last_kill_time < 30:
+            remaining = int(30 - (current_time - last_kill_time))
             send_to_player(player_id, {
                 "Type": "Error",
-                "Message": "You already attempted a kill this night."
+                "Message": f"Kill is on cooldown. Please wait {remaining} seconds."
             })
             return
 
@@ -615,6 +623,20 @@ def handle_kill(player_id, message):
         })
         return
 
+    if target["Role"] == "Rootkit":
+        send_to_player(player_id, {
+            "Type": "Error",
+            "Message": "You cannot kill the Rootkit."
+        })
+        return
+
+    if target["Room"] != room:
+        send_to_player(player_id, {
+            "Type": "Error",
+            "Message": f"'{target_name}' is not in your room."
+        })
+        return
+
     # Cannot kill yourself
     if target_id == player_id:
         send_to_player(player_id, {
@@ -624,7 +646,7 @@ def handle_kill(player_id, message):
         return
 
     with game_lock:
-        night_actions_done["virus_kill"] = True
+        last_kill_time = time.time()
 
     # Send the kill minigame prompt to the Virus
     send_to_player(player_id, {
@@ -660,8 +682,25 @@ def handle_kill_result(player_id, message):
 
     with lock:
         target = players.get(target_id)
-
         if target is None:
+            return
+
+        # Check if the target left the room while the minigame was playing
+        if target["Room"] != player["Room"]:
+            send_to_player(player_id, {
+                "Type": "Chat",
+                "Player": "SYSTEM",
+                "Message": f"Kill failed. '{target_name}' left the room."
+            })
+            return
+
+        # Check if phase changed to Discussion
+        if current_phase != "Day":
+            send_to_player(player_id, {
+                "Type": "Chat",
+                "Player": "SYSTEM",
+                "Message": f"Kill failed. The Day phase ended."
+            })
             return
 
         target["Alive"] = False
@@ -690,15 +729,15 @@ def handle_inspect(player_id, message):
 
     with lock:
         player = players.get(player_id)
-
         if player is None:
             return
+        room = player["Room"]
 
     # Validations
     if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
-            "Message": "You can only inspect during the night."
+            "Message": "You can only inspect during the Day."
         })
         return
 
@@ -720,7 +759,7 @@ def handle_inspect(player_id, message):
         if night_actions_done["detective_inspect"]:
             send_to_player(player_id, {
                 "Type": "Error",
-                "Message": "You already inspected someone this night."
+                "Message": "You already inspected someone this round."
             })
             return
 
@@ -732,6 +771,15 @@ def handle_inspect(player_id, message):
             "Message": f"Player '{target_name}' not found."
         })
         return
+
+    with lock:
+        target = players.get(target_id)
+        if target and target["Room"] != room:
+            send_to_player(player_id, {
+                "Type": "Error",
+                "Message": f"'{target_name}' is not in your room."
+            })
+            return
 
     with game_lock:
         night_actions_done["detective_inspect"] = True
@@ -754,15 +802,15 @@ def handle_revive(player_id, message):
 
     with lock:
         player = players.get(player_id)
-
         if player is None:
             return
+        room = player["Room"]
 
     # Validations
     if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
-            "Message": "You can only revive during the night."
+            "Message": "You can only revive during the Day."
         })
         return
 
@@ -808,6 +856,13 @@ def handle_revive(player_id, message):
         target = players.get(target_id)
 
     if target is None:
+        return
+
+    if target["Room"] != room:
+        send_to_player(player_id, {
+            "Type": "Error",
+            "Message": f"'{target_name}' is not in your room."
+        })
         return
 
     if target["Alive"]:
@@ -860,7 +915,7 @@ def handle_tamper(player_id, message):
     if current_phase != "Day":
         send_to_player(player_id, {
             "Type": "Error",
-            "Message": "You can only tamper during the night."
+            "Message": "You can only tamper during the Day."
         })
         return
 
@@ -895,6 +950,15 @@ def handle_tamper(player_id, message):
         })
         return
 
+    with lock:
+        target = players.get(target_id)
+        if target and target["Room"] != player["Room"]:
+            send_to_player(player_id, {
+                "Type": "Error",
+                "Message": f"'{target_name}' is not in your room."
+            })
+            return
+
     with game_lock:
         log = list(audit_logs.get(target_id, []))
 
@@ -917,6 +981,13 @@ def handle_tamper_action(player_id, message):
     target_id = find_player_id_by_name(target_name)
 
     if target_id is None:
+        return
+
+    if current_phase != "Day":
+        send_to_player(player_id, {
+            "Type": "Error",
+            "Message": "You can only tamper during the Day."
+        })
         return
 
     with game_lock:
@@ -1478,11 +1549,21 @@ def process_message(player_id, message):
             if player_id in sabotage_targets and current_phase == "Day":
                 chat_text = jumble_message(chat_text)
 
-        broadcast({
-            "Type": "Chat",
-            "Player": name,
-            "Message": chat_text,
-        })
+        if current_phase == "Day":
+            with lock:
+                recipients = [pid for pid, p in players.items() if p["Room"] == player["Room"]]
+            for pid in recipients:
+                send_to_player(pid, {
+                    "Type": "Chat",
+                    "Player": name,
+                    "Message": f"[ROOM] {chat_text}",
+                })
+        else:
+            broadcast({
+                "Type": "Chat",
+                "Player": name,
+                "Message": chat_text,
+            })
 
 
     # --------------------------------------------------------
@@ -1651,6 +1732,26 @@ def process_message(player_id, message):
             "Tasks": tasks,
             "Completed": completed,
             "Required": TASKS_PER_DAY,
+        })
+
+
+    # --------------------------------------------------------
+    # ROOM LIST
+    # --------------------------------------------------------
+
+    elif message_type == "RoomList":
+
+        with lock:
+            room = player.get("Room", "Main")
+            in_room = [
+                p["Name"] for pid, p in players.items()
+                if p.get("Room") == room and p.get("Alive", False)
+            ]
+
+        send_to_player(player_id, {
+            "Type": "RoomListResult",
+            "Room": room,
+            "Players": in_room,
         })
 
 
@@ -2435,6 +2536,26 @@ def handle_server_message(message, conn=None):
 
 
     # --------------------------------------------------------
+    # ROOM LIST RESULT
+    # --------------------------------------------------------
+
+    elif message_type == "RoomListResult":
+
+        room = message.get("Room", "")
+        players_in_room = message.get("Players", [])
+
+        print()
+        print(f"--- ROOM: {room} ---")
+        if players_in_room:
+            for p in players_in_room:
+                print(f"  - {p}")
+        else:
+            print("  (Empty)")
+        print("-" * (len(room) + 14))
+        print()
+
+
+    # --------------------------------------------------------
     # KILL MINIGAME
     # --------------------------------------------------------
 
@@ -2471,11 +2592,20 @@ def handle_server_message(message, conn=None):
         player_name = message.get("Player", "")
         msg = message.get("Message", "")
 
-        print()
-        print("☠" * 20)
-        print(f"  {msg}")
-        print("☠" * 20)
-        print()
+        # If the client themselves died, print a giant red banner
+        if player_name == client_name:
+            print()
+            print("\033[91m\033[1m" + "☠" * 40)
+            print(" " * 12 + "YOU DIED!")
+            print(" " * 12 + "Your process was terminated.")
+            print("☠" * 40 + "\033[0m")
+            print()
+        else:
+            print()
+            print("☠" * 20)
+            print(f"  {msg}")
+            print("☠" * 20)
+            print()
 
 
     # --------------------------------------------------------
@@ -2548,47 +2678,10 @@ def handle_server_message(message, conn=None):
             print("  No entries.")
 
         print()
-        print("Actions:")
-        print("  edit <index> <new_room>  — change an entry")
-        print("  add <room> <HH:MM:SS>   — add a fake entry")
+        print("Actions (type these in your normal prompt):")
+        print(f"  /tamper_edit {target} <index> <new_room>  — change an entry")
+        print(f"  /tamper_add {target} <room> <HH:MM:SS>   — add a fake entry")
         print()
-
-        action_input = input("Tamper action> ").strip()
-
-        parts = action_input.split()
-
-        if conn is not None:
-
-            if len(parts) >= 3 and parts[0] == "edit":
-                try:
-                    index = int(parts[1]) - 1
-                    new_room = " ".join(parts[2:])
-
-                    send_message(conn, {
-                        "Type": "TamperAction",
-                        "Action": "edit",
-                        "Target": target,
-                        "Index": index,
-                        "NewRoom": new_room,
-                    })
-
-                except ValueError:
-                    print("Invalid index.")
-
-            elif len(parts) >= 3 and parts[0] == "add":
-                room = parts[1]
-                timestamp = parts[2]
-
-                send_message(conn, {
-                    "Type": "TamperAction",
-                    "Action": "add",
-                    "Target": target,
-                    "Room": room,
-                    "Timestamp": timestamp,
-                })
-
-            else:
-                print("Invalid tamper action.")
 
 
     # --------------------------------------------------------
@@ -2778,6 +2871,57 @@ def client_game_loop(conn):
 
 
         # ====================================================
+        # ROOM LIST (Who is here)
+        # ====================================================
+
+        elif message == "/ls":
+
+            send_message(conn, {
+                "Type": "RoomList",
+            })
+
+
+        # ====================================================
+        # TAMPER (Rootkit)
+        # ====================================================
+
+        elif message.startswith("/tamper_edit"):
+            parts = message.split(maxsplit=3)
+            if len(parts) >= 4:
+                try:
+                    target = parts[1]
+                    index = int(parts[2]) - 1
+                    new_room = parts[3]
+                    send_message(conn, {
+                        "Type": "TamperAction",
+                        "Action": "edit",
+                        "Target": target,
+                        "Index": index,
+                        "NewRoom": new_room,
+                    })
+                except ValueError:
+                    print("Invalid index.")
+            else:
+                print("Usage: /tamper_edit <target> <index> <new_room>")
+
+        elif message.startswith("/tamper_add"):
+            parts = message.split(maxsplit=3)
+            if len(parts) >= 4:
+                target = parts[1]
+                room = parts[2]
+                timestamp = parts[3]
+                send_message(conn, {
+                    "Type": "TamperAction",
+                    "Action": "add",
+                    "Target": target,
+                    "Room": room,
+                    "Timestamp": timestamp,
+                })
+            else:
+                print("Usage: /tamper_add <target> <room> <timestamp>")
+
+
+        # ====================================================
         # KILL (Virus)
         # ====================================================
 
@@ -2930,9 +3074,10 @@ def client_game_loop(conn):
 
 def client_game(conn, name):
 
-    global client_conn
+    global client_conn, client_name
 
     client_conn = conn
+    client_name = name
 
     # ========================================================
     # TELL SERVER WHO WE ARE
