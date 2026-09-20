@@ -1380,7 +1380,7 @@ def run_game_loop():
     """
     Server-side game loop. Runs in its own thread.
 
-    Lobby -> Day -> Night -> Discussion -> Voting -> Day -> ...
+    Lobby -> Day -> Discussion -> Voting -> Day -> ...
     """
 
     global current_phase, day_number, votes
@@ -1603,7 +1603,7 @@ def process_message(player_id, message):
 
         # Apply sabotage jumbling if active
         with game_lock:
-            if player_id in sabotage_targets and current_phase == "Night":
+            if player_id in sabotage_targets and current_phase == "Day":
                 chat_text = jumble_message(chat_text)
 
         broadcast({
