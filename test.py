@@ -7,6 +7,388 @@ import subprocess
 import select
 import sys
 from datetime import datetime
+import termios
+import tty
+import os
+import termios
+import tty
+
+# ============================================================
+# WORDLE MINIGAME
+# ============================================================
+
+WORDLE_WORDS = [
+    "shell", "linux", "cache", "debug", "query",
+    "stack", "array", "bytes", "proxy", "codec",
+    "drive", "event", "error", "input", "logic",
+    "patch", "queue", "route", "space", "state",
+    "token", "trace", "virus", "write", "admin",
+    "block", "build", "click", "crash", "fetch",
+    "files", "float", "frame", "guest", "inode",
+    "parse", "ports", "reset", "stdin", "print"
+]
+
+def check_guess(guess, word):
+    result = []
+    for i in range(5):
+        if guess[i] == word[i]:
+            result.append("🟩")
+        elif guess[i] in word: 
+            result.append("🟨")
+        else:
+            result.append("⬜")
+    return result
+
+def play_wordle():
+    word = random.choice(WORDLE_WORDS)
+
+    print("=== WORDLE ===")
+    print("Guess the 5-letter word.")
+    print("🟩 = correct position")
+    print("🟨 = wrong position")
+    print("⬜ = not in word")
+    print()
+
+    attempts = 6
+
+    for attempt in range(attempts):
+        while True:
+            guess = input(
+                f"Attempt {attempt + 1}/{attempts}: "
+            ).lower().strip()
+
+            if len(guess) != 5:
+                print("Word must be exactly 5 letters.")
+                continue
+            if not guess.isalpha():
+                print("Only use letters.")
+                continue
+            break
+
+        result = check_guess(guess, word)
+
+        print(" ".join(result))
+        print()
+
+        if guess == word:
+            print("You got it!")
+            print(f"The word was: {word}")
+            return True
+
+    print("You lost!")
+    print(f"The word was: {word}")
+    return False
+
+# ============================================================
+# HANGMAN MINIGAME
+# ============================================================
+
+HANGMAN_WORDS = [
+    "python", "network", "kernel", "process", "server",
+    "terminal", "malware", "database", "compiler", "algorithm",
+    "linux", "ubuntu", "socket", "client", "packet",
+    "router", "firewall", "command", "console", "system",
+    "binary", "script", "syntax", "debugger", "runtime",
+    "program", "memory", "thread", "filesystem", "directory"
+]
+
+HANGMAN_PICS = [
+    """
+     +---+
+         |
+         |
+         |
+        ===
+    """,
+    """
+     +---+
+     O   |
+         |
+         |
+        ===
+    """,
+    """
+     +---+
+     O   |
+     |   |
+         |
+        ===
+    """,
+    """
+     +---+
+     O   |
+    /|   |
+         |
+        ===
+    """,
+    """
+     +---+
+     O   |
+    /|\\  |
+         |
+        ===
+    """,
+    """
+     +---+
+     O   |
+    /|\\  |
+    /    |
+        ===
+    """,
+    """
+     +---+
+     O   |
+    /|\\  |
+    / \\  |
+        ===
+    """
+]
+
+def play_hangman():
+    word = random.choice(HANGMAN_WORDS)
+    guessed = set()
+    wrong_guesses = 0
+    max_wrong = 6
+
+    print("=== HANGMAN ===")
+
+    while wrong_guesses < max_wrong:
+        display = ""
+        for letter in word:
+            if letter in guessed:
+                display += letter + " "
+            else:
+                display += "_ "
+
+        print(HANGMAN_PICS[wrong_guesses])
+        print("Word:", display)
+        print("Wrong guesses:", wrong_guesses, "/", max_wrong)
+
+        if all(letter in guessed for letter in word):
+            print("\nYou won!")
+            print("The word was:", word)
+            return True
+
+        guess = input("Guess a letter: ").lower().strip()
+
+        if len(guess) != 1 or not guess.isalpha():
+            print("Enter exactly one letter.\n")
+            continue
+        if guess in guessed:
+            print("You already guessed that letter.\n")
+            continue
+
+        guessed.add(guess)
+
+        if guess in word:
+            print("Correct!\n")
+        else:
+            print("Wrong!\n")
+            wrong_guesses += 1
+
+    print(HANGMAN_PICS[wrong_guesses])
+    print("You lost!")
+    print("The word was:", word)
+    return False
+
+# ============================================================
+# MEMORY MINIGAME
+# ============================================================
+
+def memory_create_board():
+    symbols = list("@@##$$!!")
+    random.shuffle(symbols)
+    return symbols
+
+def memory_display_board(board, revealed, matched):
+    print()
+    for i in range(8):
+        if i in revealed or i in matched:
+            print(f" {board[i]} ", end="")
+        else:
+            print(" ? ", end="")
+        if (i + 1) % 4 == 0:
+            print()
+    print()
+
+def play_memory():
+    board = memory_create_board()
+    revealed = set()
+    matched = set()
+    moves = 0
+
+    print("=== MEMORY GAME ===")
+    print("Memorize the board!")
+
+    memory_display_board(board, set(range(8)), matched)
+    time.sleep(2)
+    os.system("clear")
+
+    print("Find all matching pairs.")
+    print("Positions are numbered 1-8.")
+    
+    while len(matched) < 8:
+        os.system("clear")
+        memory_display_board(board, revealed, matched)
+
+        # First card
+        while True:
+            try:
+                first = int(input("First position: ")) - 1
+                if first < 0 or first >= 8:
+                    print("Choose a position from 1-8.")
+                elif first in matched:
+                    print("That card has already been matched.")
+                else:
+                    break
+            except ValueError:
+                print("Enter a number.")
+
+        revealed.add(first)
+        os.system("clear")
+        memory_display_board(board, revealed, matched)
+
+        # Second card
+        while True:
+            try:
+                second = int(input("Second position: ")) - 1
+                if second < 0 or second >= 8:
+                    print("Choose a position from 1-8.")
+                elif second == first:
+                    print("Choose a different card.")
+                elif second in matched:
+                    print("That card has already been matched.")
+                else:
+                    break
+            except ValueError:
+                print("Enter a number.")
+
+        revealed.add(second)
+        os.system("clear")
+        memory_display_board(board, revealed, matched)
+
+        moves += 1
+        if board[first] == board[second]:
+            print("MATCH!")
+            matched.add(first)
+            matched.add(second)
+        else:
+            print("Not a match.")
+            input("Press Enter to continue...")
+            revealed.remove(first)
+            revealed.remove(second)
+
+    print()
+    print("You found all the pairs!")
+    print(f"Completed in {moves} moves.")
+    return True
+
+# ============================================================
+# KILL MINIGAME
+# ============================================================
+
+KILL_MESSAGES = [
+    "Preparing knife...",
+    "Preparing mentally...",
+    "Sneaking from behind...",
+    "Checking if anyone is watching...",
+    "Walking suspiciously...",
+    "Pretending to do a task...",
+    "Looking innocent...",
+    "Activating murder.exe...",
+    "Finding the nearest victim...",
+    "Making a very questionable decision...",
+    "Sharpening imaginary knife...",
+    "Hiding in the shadows...",
+    "Waiting for the perfect moment...",
+    "Practicing evil laugh...",
+    "Making sure nobody is looking...",
+]
+
+KILL_KEYS = {
+    " ": "SPACE",
+    "\n": "ENTER",
+    "\t": "TAB",
+    "\x7f": "BACKSPACE",
+}
+
+def play_ping():
+    print("=== FILE SYSTEM PING TASK ===")
+    print("You need to verify packet transmission to remote servers.")
+    print("Type the IP addresses exactly as they appear to ping them.\n")
+    
+    ips = [f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}" for _ in range(3)]
+    for ip in ips:
+        print(f"Target: {ip}")
+        ans = input("Enter IP: ").strip()
+        if ans != ip:
+            print("Ping failed! Packet lost.")
+            return False
+        print("Reply from " + ip + ": bytes=32 time=14ms TTL=117\n")
+    
+    print("Ping complete! All packets received.")
+    return True
+
+def kill_get_key(timeout):
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            return sys.stdin.read(1)
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def play_kill_minigame():
+    os.system("clear")
+    print("=== KILL ===")
+    print()
+
+    messages = KILL_MESSAGES.copy()
+    random.shuffle(messages)
+    num_messages = random.randint(2, 4)
+
+    for message in messages[:num_messages]:
+        os.system("clear")
+        print("=== KILL ===")
+        print()
+        print(message)
+        time.sleep(1)
+
+    correct_key = random.choice(list(KILL_KEYS.keys()))
+    key_name = KILL_KEYS[correct_key]
+
+    os.system("clear")
+    print("=== KILL ===")
+    print()
+    print(f"PRESS [{key_name}] NOW!")
+
+    time_limit = 2.0
+    pressed_key = kill_get_key(time_limit)
+
+    os.system("clear")
+
+    if pressed_key == correct_key:
+        print("=== KILL SUCCESS ===")
+        print()
+        print("Target terminated.")
+        return True
+    elif pressed_key is None:
+        print("=== KILL FAILED ===")
+        print()
+        print("You hesitated.")
+        print("The target escaped.")
+        return False
+    else:
+        pressed_name = KILL_KEYS.get(pressed_key, repr(pressed_key))
+        print("=== KILL FAILED ===")
+        print()
+        print(f"You pressed [{pressed_name}]")
+        print(f"You needed [{key_name}]")
+        print("The target escaped.")
+        return False
 
 
 # ============================================================
@@ -93,16 +475,18 @@ recently_dead = []
 
 # Room -> minigame mapping
 ROOM_TASKS = {
-    "GPU": "memory",
-    "CyberSec": "hangman",
-    "Web Dev": "wordle",
+    "File System": "ping",
+    "Memory": "memory",
+    "Security": "hangman",
+    "Web Server": "wordle",
 }
 
 # Short descriptions shown in the HUD so tasks feel like actual terminal work.
 TASK_DESCRIPTIONS = {
-    "GPU": "Match memory blocks to verify GPU buffer allocation.",
-    "CyberSec": "Analyze a suspicious security term from the incident logs.",
-    "Web Dev": "Verify a deployment keyword from the web service logs.",
+    "File System": "Ping remote servers to verify packet transmission.",
+    "Memory": "Match memory blocks to verify GPU buffer allocation.",
+    "Security": "Analyze a suspicious security term from the incident logs.",
+    "Web Server": "Verify a deployment keyword from the web service logs.",
 }
 
 # Lock for game state modifications
@@ -251,6 +635,24 @@ def broadcast_to_room(room, message):
 # PLAYER MANAGEMENT
 # ============================================================
 
+PROCESS_NAMES = [
+    "systemd.exe", "sshd.exe", "nginx.exe", "apache.exe", "bash.exe",
+    "python.exe", "node.exe", "gcc.exe", "mysql.exe", "postgres.exe",
+    "redis.exe", "docker.exe", "cron.exe", "init.exe", "daemon.exe",
+    "kernel.exe", "shell.exe", "sudo.exe", "grep.exe", "chmod.exe",
+    "worker.exe", "scheduler.exe", "compiler.exe", "firewall.exe"
+]
+
+def get_unique_process_name():
+    with lock:
+        used_names = {p["Name"] for p in players.values()}
+    
+    available = [n for n in PROCESS_NAMES if n not in used_names]
+    if not available:
+        return f"process_{random.randint(1000, 9999)}.exe"
+    return random.choice(available)
+# ============================================================
+
 def add_player(conn, name):
 
     global next_player_id
@@ -262,7 +664,7 @@ def add_player(conn, name):
 
         players[player_id] = {
             "Name": name,
-            "Room": "Common",
+            "Room": "File System",
             "Role": None,
             "Alive": True,
             "Tasks": [],
@@ -369,12 +771,18 @@ def assign_roles():
 
     roles = ["Virus", "System Admin"]
 
-    if num_players > 5:
+    if num_players >= 5:
         roles.extend(["Rootkit", "Antivirus"])
 
     # Fill remaining with Process
     while len(roles) < num_players:
         roles.append("Process")
+        
+    # Jester logic: >= 5 players, 50% chance of exactly 1 Jester replacing a Process
+    if num_players >= 5 and random.random() < 0.5:
+        if "Process" in roles:
+            roles.remove("Process")
+            roles.append("Jester")
 
     # Assign roles
     for i, pid in enumerate(player_ids):
@@ -438,7 +846,7 @@ def add_action_audit_entry(player_id, room=None):
 
 #function to move rooms
 def switch_rooms(player_id, message,name):
-    valid_rooms = ["Common","GPU","CyberSec","Web Dev"]
+    valid_rooms = ["File System", "Memory", "Security", "Web Server"]
     room=message.get('Message')
     
     if room not in valid_rooms:
@@ -503,10 +911,10 @@ def switch_rooms(player_id, message,name):
 # ============================================================
 
 def assign_tasks_for_day():
-    """Assign TASKS_PER_DAY random room-tasks to each alive good-team player."""
+    """Assign TASKS_PER_DAY room-tasks to each alive task-doing player."""
 
-    good_roles = {"Process", "System Admin", "Antivirus"}
-    task_rooms = list(ROOM_TASKS.keys())
+    good_roles = {"Process", "System Admin", "Antivirus", "Jester"}
+    random_task_rooms = ["Memory", "Security", "Web Server"]
 
     with lock:
         alive_good = [
@@ -516,9 +924,8 @@ def assign_tasks_for_day():
 
     for pid, player in alive_good:
 
-        # Pick TASKS_PER_DAY random rooms (or fewer if not enough rooms)
-        num = min(TASKS_PER_DAY, len(task_rooms))
-        assigned = random.sample(task_rooms, num)
+        # Assign 2 random tasks
+        assigned = random.sample(random_task_rooms, 2)
 
         with lock:
             players[pid]["Tasks"] = list(assigned)
@@ -531,9 +938,9 @@ def assign_tasks_for_day():
 
 
 def check_all_tasks_complete():
-    """Check if all alive good-team players have finished their tasks."""
+    """Check if all alive task-doing players have finished their tasks."""
 
-    good_roles = {"Process", "System Admin", "Antivirus"}
+    good_roles = {"Process", "System Admin", "Antivirus", "Jester"}
 
     with lock:
         for pid, player in players.items():
@@ -628,20 +1035,30 @@ def handle_task_result(player_id, message):
         })
         return
 
-    # Mark task as complete
+    # Mark task as complete while holding the state lock.
+    # Do NOT call send_to_player() while holding lock because send_to_player()
+    # acquires the same non-reentrant lock and would deadlock the server.
+    task_completed = False
+    remaining = 0
+    completed_count = 0
+
     with lock:
         if room in player["Tasks"]:
             player["Tasks"].remove(room)
             player["TasksCompleted"] += 1
+            remaining = len(player["Tasks"])
+            completed_count = player["TasksCompleted"]
+            task_completed = True
 
-            send_to_player(player_id, {
-                "Type": "TaskComplete",
-                "Room": room,
-                "Remaining": len(player["Tasks"]),
-            })
+    if task_completed:
+        send_to_player(player_id, {
+            "Type": "TaskComplete",
+            "Room": room,
+            "Remaining": remaining,
+        })
 
-            print(f"[SERVER] {name} completed task in {room}. "
-                  f"{player['TasksCompleted']}/{TASKS_PER_DAY} done.")
+        print(f"[SERVER] {name} completed task in {room}. "
+              f"{completed_count}/{TASKS_PER_DAY} done.")
 
     # Check if all tasks are done for early day end
     if check_all_tasks_complete():
@@ -1433,6 +1850,8 @@ def announce_winner(winner):
 
     if winner == "Good":
         msg = "THE GOOD TEAM WINS! All threats have been eliminated."
+    elif winner == "Jester":
+        msg = "GAME OVER — Jester wins!"
     else:
         msg = "THE BAD TEAM WINS! The system has been compromised."
 
@@ -1630,6 +2049,11 @@ def run_game_loop():
             print(
                 f"[SERVER] {eliminated_name} was voted out."
             )
+            
+            # Check for Jester win condition
+            if target and target.get("Role") == "Jester":
+                announce_winner("Jester")
+                break
 
             # Check win condition
             winner = check_win_conditions()
@@ -1978,7 +2402,7 @@ def handle_player(conn, addr):
             return
 
 
-        name = player_info["Name"]
+        name = get_unique_process_name()
 
         player_id = add_player(
             conn,
@@ -1988,6 +2412,12 @@ def handle_player(conn, addr):
 
         print()
         print(f"{name} connected from {addr}")
+
+        # Send the assigned name to the client
+        send_message(conn, {
+            "Type": "YourName",
+            "Name": name
+        })
 
         # Send the current lobby state to the new player
         with lock:
@@ -2822,7 +3252,13 @@ def handle_server_message(message, conn=None):
             f"Server event ({message_type}) received."
         )
 
-    if message_type == "PlayerList":
+    if message_type == "YourName":
+        global client_name
+        client_name = message.get("Name", client_name)
+        # Force the UI dict to know we are alive (just in case)
+        ui_players.setdefault(client_name, {"Alive": True})
+
+    elif message_type == "PlayerList":
         for player_name in message.get("Players", []):
             ui_players.setdefault(player_name, {"Alive": True})
 
@@ -2887,9 +3323,9 @@ def handle_server_message(message, conn=None):
             # A new day starts a fresh audit-evidence section.
             ui_audit_leaks = []
 
-            # All players start the game in Common.
+            # All players start the game in File System.
             if ui_current_room == "Lobby":
-                ui_current_room = "Common"
+                ui_current_room = "File System"
                 ui_room_players = None
 
             log_event(
@@ -2991,7 +3427,7 @@ def handle_server_message(message, conn=None):
 
             try:
                 cmd = (
-                    f"from {minigame} import play_{minigame}; "
+                    f"from test import play_{minigame}; "
                     f"import sys; "
                     f"sys.exit(0 if play_{minigame}() else 1)"
                 )
@@ -3083,9 +3519,9 @@ def handle_server_message(message, conn=None):
 
             try:
                 cmd = (
-                    "from kill_minigame import kill_minigame; "
+                    "from test import play_kill_minigame; "
                     "import sys; "
-                    "sys.exit(0 if kill_minigame() else 1)"
+                    "sys.exit(0 if play_kill_minigame() else 1)"
                 )
 
                 proc = subprocess.Popen(
@@ -3308,6 +3744,7 @@ def client_game_loop(conn):
             if active_minigame_process is not None:
                 while active_minigame_process is not None:
                     time.sleep(0.1)
+                
                 ui_dirty = True
                 
             if ui_dirty and active_minigame_process is None:
