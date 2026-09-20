@@ -25,6 +25,7 @@ DAY_DURATION = 120        # seconds
 NIGHT_DURATION = 30       # seconds
 DISCUSSION_DURATION = 45  # seconds
 VOTING_DURATION = 20      # seconds
+GAME_OVER_DELAY = 5       # seconds before returning to the lobby
 TASKS_PER_DAY = 2
 MAX_SABOTAGES = 2
 MAX_ROOTKIT_USES = 2
@@ -63,7 +64,7 @@ recv_lock = threading.Lock()
 current_phase = "Lobby"
 day_number = 0
 
-# Audit logs: { player_id: [ {"Room": str, "Timestamp": str}, ... ] }
+# Audit logs: { player_id: [ {"Type": "MOVE"|"ACTION", "Room": str, "Timestamp": str}, ... ] }
 audit_logs = {}
 
 # Votes this round: { voter_id: target_name }
@@ -81,7 +82,7 @@ antivirus_used = False
 
 # Day action tracking (reset each day)
 night_actions_done = {
-    "detective_inspect": False,
+    "system_admin_inspect": False,
     "antivirus_revive": False,
 }
 
@@ -95,6 +96,13 @@ ROOM_TASKS = {
     "GPU": "memory",
     "CyberSec": "hangman",
     "Web Dev": "wordle",
+}
+
+# Short descriptions shown in the HUD so tasks feel like actual terminal work.
+TASK_DESCRIPTIONS = {
+    "GPU": "Match memory blocks to verify GPU buffer allocation.",
+    "CyberSec": "Analyze a suspicious security term from the incident logs.",
+    "Web Dev": "Verify a deployment keyword from the web service logs.",
 }
 
 # Lock for game state modifications
@@ -123,6 +131,23 @@ client_alive = True
 # Active minigame subprocess
 active_minigame_process = None
 
+# Set when the server/client state forces the current minigame to stop.
+# This prevents an interrupted minigame thread from sending a stale result.
+minigame_cancelled = False
+
+# ============================================================
+# UI STATE (CLIENT-SIDE)
+# ============================================================
+
+ui_players = {}      # dict mapping player name -> dict with "Alive": bool
+ui_current_room = "Lobby"
+ui_room_players = None # last known room occupants; None means not checked yet
+ui_tasks = []        # list of dicts: {"room": str, "completed": bool}
+ui_chat_log = []     # list of strings
+ui_audit_leaks = []  # leaked audit log entries for the current discussion
+ui_phase = "Lobby"
+ui_day_num = 0
+ui_time_left = 0
 
 # ============================================================
 # MESSAGE FUNCTIONS
@@ -205,6 +230,23 @@ def send_to_player(player_id, message):
             pass
 
 
+def broadcast_to_room(room, message):
+    """Send a message only to players who are in the given room right now."""
+
+    with lock:
+        room_connections = [
+            connections[pid]
+            for pid, player in players.items()
+            if player.get("Room") == room and pid in connections
+        ]
+
+    for conn in room_connections:
+        try:
+            send_message(conn, message)
+        except ConnectionError:
+            pass
+
+
 # ============================================================
 # PLAYER MANAGEMENT
 # ============================================================
@@ -260,6 +302,11 @@ def remove_player(player_id):
             "Message": f'{player["Name"]} left the game.'
         })
 
+        if current_phase != "Lobby" and current_phase != "GameOver":
+            winner = check_win_conditions()
+            if winner:
+                announce_winner(winner)
+
 
 def find_player_id_by_name(name):
 
@@ -289,7 +336,7 @@ def get_alive_by_team(team):
     team = 'good' or 'bad'
     """
 
-    good_roles = {"Process", "Detective", "Antivirus"}
+    good_roles = {"Process", "System Admin", "Antivirus"}
     bad_roles = {"Virus", "Rootkit"}
 
     target_roles = good_roles if team == "good" else bad_roles
@@ -310,8 +357,8 @@ def assign_roles():
     Assign roles to all players.
 
     Distribution:
-    4 players: 1 Virus, 1 Rootkit, 1 Detective, 1 Process
-    5+ players: 1 Virus, 1 Rootkit, 1 Detective, 1 Antivirus, rest Process
+    4 players: 1 Virus, 1 Rootkit, 1 System Admin, 1 Process
+    5+ players: 1 Virus, 1 Rootkit, 1 System Admin, 1 Antivirus, rest Process
     """
 
     with lock:
@@ -320,7 +367,7 @@ def assign_roles():
     num_players = len(player_ids)
     random.shuffle(player_ids)
 
-    roles = ["Virus", "Detective"]
+    roles = ["Virus", "System Admin"]
 
     if num_players > 5:
         roles.extend(["Rootkit", "Antivirus"])
@@ -352,6 +399,28 @@ def add_audit_entry(player_id, room):
     """Record a room movement in the player's audit log."""
 
     entry = {
+        "Type": "MOVE",
+        "Room": room,
+        "Timestamp": datetime.now().strftime("%H:%M:%S"),
+    }
+
+    with game_lock:
+        if player_id in audit_logs:
+            audit_logs[player_id].append(entry)
+        else:
+            audit_logs[player_id] = [entry]
+
+
+def add_action_audit_entry(player_id, room=None):
+    """Record that the player performed an action without revealing what it was."""
+
+    if room is None:
+        with lock:
+            player = players.get(player_id)
+            room = player.get("Room", "Unknown") if player else "Unknown"
+
+    entry = {
+        "Type": "ACTION",
         "Room": room,
         "Timestamp": datetime.now().strftime("%H:%M:%S"),
     }
@@ -415,9 +484,16 @@ def switch_rooms(player_id, message,name):
         {
             "Type": "Chat",
             "Player": "SYSTEM",
-            "Message": f"You moved from {current_room} to {room}.\n  Players here: {players_str}"
+            "Message": f"You moved from {current_room} to {room}.  Players here: {players_str}"
         }
     )
+
+    # Send structured room state so the HUD can update without parsing text.
+    send_to_player(player_id, {
+        "Type": "RoomInfo",
+        "Room": room,
+        "Players": players_here
+    })
 
     return 1
 
@@ -429,7 +505,7 @@ def switch_rooms(player_id, message,name):
 def assign_tasks_for_day():
     """Assign TASKS_PER_DAY random room-tasks to each alive good-team player."""
 
-    good_roles = {"Process", "Detective", "Antivirus"}
+    good_roles = {"Process", "System Admin", "Antivirus"}
     task_rooms = list(ROOM_TASKS.keys())
 
     with lock:
@@ -457,7 +533,7 @@ def assign_tasks_for_day():
 def check_all_tasks_complete():
     """Check if all alive good-team players have finished their tasks."""
 
-    good_roles = {"Process", "Detective", "Antivirus"}
+    good_roles = {"Process", "System Admin", "Antivirus"}
 
     with lock:
         for pid, player in players.items():
@@ -515,6 +591,10 @@ def handle_task_request(player_id):
             "Message": f"You don't have a task assigned in {room}."
         })
         return
+
+    # This is a real game action, but the audit log deliberately does not
+    # reveal that it was a task.
+    add_action_audit_entry(player_id, room)
 
     # Tell client to launch the minigame
     minigame = ROOM_TASKS[room]
@@ -657,6 +737,8 @@ def handle_kill(player_id, message):
         })
         return
 
+    # Log the action without revealing that it was a kill.
+    add_action_audit_entry(player_id, player["Room"])
 
     with game_lock:
         last_kill_time = time.time()
@@ -680,11 +762,21 @@ def handle_kill_result(player_id, message):
         if player is None:
             return
 
+        # Capture the room at the exact moment the kill result is handled.
+        # The alert is sent only to players currently in this room.
+        action_room = player.get("Room", "Lobby")
+
     if not success:
         send_to_player(player_id, {
             "Type": "Chat",
             "Player": "SYSTEM",
             "Message": "Kill failed. The target escaped."
+        })
+
+        broadcast_to_room(action_room, {
+            "Type": "Chat",
+            "Player": "SYSTEM",
+            "Message": "A kill was attempted, but it failed."
         })
         return
 
@@ -699,11 +791,17 @@ def handle_kill_result(player_id, message):
         if target is None:
             return
 
-        if target["Room"] != player["Room"]:
+        if target["Room"] != action_room:
             send_to_player(player_id, {
                 "Type": "Chat",
                 "Player": "SYSTEM",
                 "Message": f"Kill failed. '{target_name}' left the room!"
+            })
+
+            broadcast_to_room(action_room, {
+                "Type": "Chat",
+                "Player": "SYSTEM",
+                "Message": "A kill was attempted, but it failed."
             })
             return
 
@@ -711,6 +809,13 @@ def handle_kill_result(player_id, message):
 
     with game_lock:
         recently_dead.append(target_id)
+
+    # Announce the kill only to players who are in the room at this instant.
+    broadcast_to_room(action_room, {
+        "Type": "Chat",
+        "Player": "SYSTEM",
+        "Message": "A kill was committed."
+    })
 
     send_to_player(player_id, {
         "Type": "Chat",
@@ -727,7 +832,7 @@ def handle_kill_result(player_id, message):
 
 
 def handle_inspect(player_id, message):
-    """Handle Detective audit inspection."""
+    """Handle System Admin audit inspection."""
 
     target_name = message.get("Target", "")
 
@@ -745,10 +850,10 @@ def handle_inspect(player_id, message):
         })
         return
 
-    if player["Role"] != "Detective":
+    if player["Role"] != "System Admin":
         send_to_player(player_id, {
             "Type": "Error",
-            "Message": "Only the Detective can inspect."
+            "Message": "Only the System Admin can inspect."
         })
         return
 
@@ -760,7 +865,7 @@ def handle_inspect(player_id, message):
         return
 
     with game_lock:
-        if night_actions_done["detective_inspect"]:
+        if night_actions_done["system_admin_inspect"]:
             send_to_player(player_id, {
                 "Type": "Error",
                 "Message": "You already inspected someone this night."
@@ -789,11 +894,14 @@ def handle_inspect(player_id, message):
         })
         return
 
+    # The audit log records only that an action occurred.
+    add_action_audit_entry(player_id, player["Room"])
+
     with game_lock:
-        night_actions_done["detective_inspect"] = True
+        night_actions_done["system_admin_inspect"] = True
         log = list(audit_logs.get(target_id, []))
 
-    # Send audit log only to the Detective
+    # Send audit log only to the System Admin
     send_to_player(player_id, {
         "Type": "AuditLog",
         "Target": target_name,
@@ -879,6 +987,9 @@ def handle_revive(player_id, message):
             "Message": f"'{target_name}' is not dead."
         })
         return
+
+    # Log the revive as an anonymous action.
+    add_action_audit_entry(player_id, player["Room"])
 
     # Revive the target
     with lock:
@@ -997,6 +1108,14 @@ def handle_tamper_action(player_id, message):
     action = message.get("Action", "")
     target_name = message.get("Target", "")
 
+    with lock:
+        actor = players.get(player_id)
+
+    if actor is None:
+        return
+
+    actor_room = actor.get("Room", "Unknown")
+
     target_id = find_player_id_by_name(target_name)
 
     if target_id is None:
@@ -1017,7 +1136,14 @@ def handle_tamper_action(player_id, message):
         with game_lock:
             log = audit_logs.get(target_id, [])
 
-            if 0 <= index < len(log):
+            valid_index = 0 <= index < len(log)
+
+        if valid_index:
+            # Record the Rootkit's tamper as an action in its own log.
+            add_action_audit_entry(player_id, actor_room)
+
+            with game_lock:
+                log = audit_logs.get(target_id, [])
                 old_room = log[index]["Room"]
                 log[index]["Room"] = new_room
                 rootkit_uses_remaining -= 1
@@ -1031,21 +1157,25 @@ def handle_tamper_action(player_id, message):
                         f"({rootkit_uses_remaining} uses left)"
                     ),
                 })
-            else:
-                send_to_player(player_id, {
-                    "Type": "Error",
-                    "Message": "Invalid entry index."
-                })
+        else:
+            send_to_player(player_id, {
+                "Type": "Error",
+                "Message": "Invalid entry index."
+            })
 
     elif action == "add":
         room = message.get("Room", "")
         timestamp = message.get("Timestamp", "")
+
+        # Log the Rootkit action separately from the fake entry it creates.
+        add_action_audit_entry(player_id, actor_room)
 
         with game_lock:
             if target_id not in audit_logs:
                 audit_logs[target_id] = []
 
             audit_logs[target_id].append({
+                "Type": "ACTION",
                 "Room": room,
                 "Timestamp": timestamp,
             })
@@ -1135,6 +1265,9 @@ def handle_sabotage(player_id, message):
         })
         return
 
+    # Log sabotage only as an anonymous action.
+    add_action_audit_entry(player_id, player["Room"])
+
     with game_lock:
         sabotages_remaining -= 1
         sabotage_targets.add(target_id)
@@ -1208,6 +1341,9 @@ def handle_vote(player_id, message):
             "Message": f"'{target_name}' is not alive."
         })
         return
+
+    # Voting is also an action, but the audit log does not reveal what was voted.
+    add_action_audit_entry(player_id, player["Room"])
 
     votes[player_id] = target_name
 
@@ -1343,7 +1479,7 @@ def run_game_loop():
     """
 
     global current_phase, day_number, votes
-    global night_actions_done, recently_dead, sabotage_targets
+    global night_actions_done, recently_dead, sabotage_targets, game_started
 
     # Wait for game_started signal
     game_started.wait()
@@ -1379,7 +1515,7 @@ def run_game_loop():
 
         # Reset daily actions
         with game_lock:
-            night_actions_done["detective_inspect"] = False
+            night_actions_done["system_admin_inspect"] = False
             night_actions_done["antivirus_revive"] = False
 
         # Assign tasks
@@ -1511,7 +1647,45 @@ def run_game_loop():
 
             print("[SERVER] No elimination — tied vote.")
 
-    print("[SERVER] Game loop ended.")
+    print(f"[SERVER] Game loop ended. Returning to lobby in {GAME_OVER_DELAY} seconds.")
+    time.sleep(GAME_OVER_DELAY)
+    
+    with lock:
+        for pid, p in players.items():
+            p["Alive"] = True
+            p["Role"] = None
+            p["Room"] = "Lobby"
+            p["Tasks"] = []
+            p["TasksCompleted"] = 0
+            
+    with game_lock:
+        audit_logs.clear()
+        for pid in players:
+            audit_logs[pid] = []
+        recently_dead.clear()
+        sabotage_targets.clear()
+        day_number = 0
+        current_phase = "Lobby"
+        game_started.clear()
+        
+    broadcast({
+        "Type": "RoomInfo",
+        "Room": "Lobby",
+        "Players": [p["Name"] for p in players.values()]
+    })
+    
+    broadcast({
+        "Type": "PhaseChange",
+        "Phase": "Lobby"
+    })
+    
+    broadcast({
+        "Type": "Chat",
+        "Player": "SYSTEM",
+        "Message": "The lobby has been reset for a new game. Type /start or start game to begin!"
+    })
+    
+    print("[SERVER] Game state reset to Lobby.")
 
 
 # ============================================================
@@ -1529,6 +1703,29 @@ def process_message(player_id, message):
     name = player["Name"]
 
     message_type = message.get("Type")
+
+    # --------------------------------------------------------
+    # START GAME
+    # --------------------------------------------------------
+    
+    if message_type == "StartGame":
+        if current_phase == "Lobby" and not game_started.is_set():
+            with lock:
+                player_count = len(players)
+            if player_count < 3:
+                send_to_player(player_id, {
+                    "Type": "Error",
+                    "Message": f"Need at least 3 players to start (currently {player_count})."
+                })
+            else:
+                broadcast({
+                    "Type": "Chat",
+                    "Player": "SYSTEM",
+                    "Message": f"{name} started the game!"
+                })
+                threading.Thread(target=run_game_loop, daemon=True).start()
+                game_started.set()
+        return
 
 
     # --------------------------------------------------------
@@ -1679,7 +1876,7 @@ def process_message(player_id, message):
 
 
     # --------------------------------------------------------
-    # INSPECT (Detective)
+    # INSPECT (System Admin)
     # --------------------------------------------------------
 
     elif message_type == "Inspect":
@@ -1752,16 +1949,11 @@ def process_message(player_id, message):
         players_str = ", ".join(players_here) if players_here else "Nobody else is here."
 
         send_to_player(player_id, {
-            "Type": "Chat",
-            "Player": "SYSTEM",
-            "Message": (
-                f"\n--- ROOM INFO ---\n"
-                f"  You are in: {room}\n"
-                f"  Other players here: {players_str}\n"
-                f"  Available rooms: Common, GPU, CyberSec, Web Dev\n"
-                f"-----------------"
-            )
+            "Type": "RoomInfo",
+            "Room": room,
+            "Players": players_here
         })
+
 
 
 # ============================================================
@@ -1797,42 +1989,27 @@ def handle_player(conn, addr):
         print()
         print(f"{name} connected from {addr}")
 
+        # Send the current lobby state to the new player
+        with lock:
+            all_players = [p["Name"] for p in players.values()]
+        
+        send_message(conn, {
+            "Type": "PlayerList",
+            "Players": all_players
+        })
+
 
         # Tell everyone that this player joined
         broadcast({
             "Type": "Join",
             "Player": name,
-            "Message": f"{name} just popped in!"
+            "Message": f"{name} just popped in! (Type /start or start game to begin)"
         })
 
 
         # ====================================================
-        # WAIT FOR HOST TO START GAME
+        # LISTEN FOR GAME MESSAGES
         # ====================================================
-
-        print(
-            f"{name} is waiting for the game to start..."
-        )
-
-        game_started.wait()
-
-
-        # ====================================================
-        # GAME HAS STARTED
-        # ====================================================
-
-        print(
-            f"{name} is now listening for game messages."
-        )
-
-
-        # Tell this player that the game started
-        send_message(
-            conn,
-            {
-                "Type": "GameStart"
-            }
-        )
 
 
         # ====================================================
@@ -1973,6 +2150,9 @@ def discovery_loop(discovery, game_id):
 
 def host_game(name):
 
+    global client_conn, client_name
+    client_name = name
+
     game_id = input(
         "Enter Game ID: "
     ).strip()
@@ -2074,6 +2254,7 @@ def host_game(name):
     )
     print()
     print("Waiting for players...")
+    print("Type /start or start game in the chat to begin the game.")
     print()
 
 
@@ -2114,53 +2295,24 @@ def host_game(name):
 
 
     # ========================================================
-    # WAIT FOR HOST COMMAND
-    # ========================================================
-
-    while True:
-
-        command = input("> ").strip().lower()
-
-
-        if command == "start game":
-
-            print()
-            print("================================")
-            print("          GAME STARTED")
-            print("================================")
-            print()
-
-
-            # Start the game loop thread
-            threading.Thread(
-                target=run_game_loop,
-                daemon=True
-            ).start()
-
-            # Releases every handle_player()
-            # currently waiting.
-            game_started.set()
-
-            break
-
-        elif command.startswith("/chat "):
-            chat_msg = command[6:].strip()
-            if chat_msg:
-                send_message(host_connection, {
-                    "Type": "Chat",
-                    "Message": chat_msg
-                })
-
-        else:
-
-            print(
-                "Type 'start game' to begin, or '/chat <msg>' to talk."
-            )
-
-
-    # ========================================================
     # HOST IS NOW A PLAYER
     # ========================================================
+
+    # Initialize the host's local UI state just like a normal client.
+    global client_role, client_alive
+    global ui_players, ui_current_room, ui_room_players
+    global ui_tasks, ui_chat_log, ui_phase, ui_day_num
+
+    client_role = None
+    client_alive = True
+    ui_players = {}
+    ui_current_room = "Lobby"
+    ui_room_players = None
+    ui_tasks = []
+    ui_chat_log = []
+    ui_audit_leaks = []
+    ui_phase = "Lobby"
+    ui_day_num = 0
 
     client_game_loop(
         host_connection
@@ -2293,445 +2445,805 @@ def client_receive_loop(conn):
             break
 
 
+
+# ============================================================
+# CLIENT UI RENDERING
+# ============================================================
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+YELLOW = "\033[93m"
+
+# One lock for terminal rendering. The receive thread and the input
+# thread can both request a redraw, so only one can draw at a time.
+ui_draw_lock = threading.RLock()
+ui_dirty = True
+
+# Keep the HUD compact enough for normal laptop terminals.
+HUD_WIDTH = 78
+
+# ANSI escape sequence for a real redraw rather than appending output.
+CLEAR_SCREEN = "\033[2J\033[H"
+ENTER_ALT_SCREEN = "\033[?1049h\033[H\033[2J"
+EXIT_ALT_SCREEN = "\033[?1049l"
+
+
+def enter_hud_screen():
+    """Switch to a dedicated terminal screen for the HUD."""
+    sys.stdout.write(ENTER_ALT_SCREEN)
+    sys.stdout.flush()
+
+
+def exit_hud_screen():
+    """Restore whatever was on the terminal before the game HUD."""
+    sys.stdout.write(EXIT_ALT_SCREEN)
+    sys.stdout.flush()
+
+
+def clear_terminal():
+    """Clear the HUD screen and put the cursor at the top-left."""
+    sys.stdout.write(CLEAR_SCREEN)
+    sys.stdout.flush()
+
+
+def strip_ansi(text):
+    import re
+    return re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", str(text))
+
+
+def visible_width(text):
+    """
+    Return an approximate terminal display width.
+
+    wcwidth is used when available. The fallback handles the common
+    full-width Unicode characters without requiring a dependency.
+    """
+    clean = strip_ansi(text)
+
+    try:
+        from wcwidth import wcswidth
+        width = wcswidth(clean)
+        if width >= 0:
+            return width
+    except ImportError:
+        pass
+
+    import unicodedata
+    width = 0
+    for char in clean:
+        if unicodedata.combining(char):
+            continue
+        if unicodedata.east_asian_width(char) in ("F", "W"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def truncate_visible(text, max_width):
+    """Truncate coloured/unicode text without letting it exceed the box."""
+    if visible_width(text) <= max_width:
+        return text
+
+    clean = strip_ansi(text)
+    result = ""
+    width = 0
+
+    for char in clean:
+        char_width = visible_width(char)
+        if width + char_width > max_width - 3:
+            break
+        result += char
+        width += char_width
+
+    return result + "..."
+
+
+def wrap_visible(text, max_width):
+    """
+    Wrap text based on visible terminal width.
+    ANSI codes are intentionally stripped from wrapped chat lines;
+    this keeps the box reliable even for coloured messages.
+    """
+    import textwrap
+
+    clean = strip_ansi(text)
+    if not clean:
+        return [""]
+
+    return textwrap.wrap(
+        clean,
+        width=max_width,
+        break_long_words=True,
+        break_on_hyphens=False
+    ) or [""]
+
+
+def box_line(content="", align="left"):
+    """Render exactly one HUD row. Long content is not silently truncated."""
+    content = str(content)
+
+    # box_line is for content that is already known to fit on one line.
+    # Long content should use print_wrapped_box() instead.
+    if visible_width(content) > HUD_WIDTH:
+        content = strip_ansi(content)[:HUD_WIDTH]
+
+    width = visible_width(content)
+    padding = max(0, HUD_WIDTH - width)
+
+    if align == "center":
+        left = padding // 2
+        right = padding - left
+        return f"║{' ' * left}{content}{' ' * right}║"
+
+    return f"║{content}{' ' * padding}║"
+
+
+def print_wrapped_box(content, indent=""):
+    """Print content across as many HUD rows as necessary."""
+    available = max(1, HUD_WIDTH - visible_width(indent))
+    lines = wrap_visible(content, available)
+
+    for line in lines:
+        print(box_line(indent + line))
+
+
+def section_header(title):
+    # Section titles are short in normal use; wrap them safely if needed.
+    return box_line(f" {CYAN}{BOLD}{title}{RESET}")
+
+
+def log_event(msg):
+    """Add one message/event to the HUD history."""
+    global ui_chat_log, ui_dirty
+
+    # Store the event once. Rendering is handled separately.
+    ui_chat_log.append(str(msg))
+
+    # Keep the HUD compact.
+    if len(ui_chat_log) > 12:
+        ui_chat_log = ui_chat_log[-12:]
+    ui_dirty = True
+
+
+def stop_active_minigame(reason=""):
+    """Stop the current minigame immediately and return control to the HUD."""
+    global active_minigame_process, minigame_cancelled, ui_dirty
+
+    proc = active_minigame_process
+    if proc is None:
+        return False
+
+    minigame_cancelled = True
+
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=0.5)
+    except Exception:
+        pass
+
+    active_minigame_process = None
+    ui_dirty = True
+
+    if reason:
+        log_event(f"{YELLOW}[!] {reason} Minigame stopped.{RESET}")
+
+    return True
+
+
+def draw_hud():
+    """
+    Render the ENTIRE HUD.
+
+    This function is presentation-only:
+    - It reads current UI/client state.
+    - It does NOT process network messages.
+    - It does NOT call handle_server_message().
+    - It does NOT modify game state.
+    """
+    if active_minigame_process is not None:
+        return
+
+    with ui_draw_lock:
+        clear_terminal()
+
+        top = "╔" + "═" * HUD_WIDTH + "╗"
+        mid = "╠" + "═" * HUD_WIDTH + "╣"
+        bottom = "╚" + "═" * HUD_WIDTH + "╝"
+
+        print(top)
+        print(box_line(f"{CYAN}{BOLD}PROCESS MAFIA{RESET}", align="center"))
+        print(mid)
+
+        # --------------------------------------------------------
+        # PLAYER
+        # --------------------------------------------------------
+        role = client_role if client_role else "Unknown"
+        status = f"{GREEN}ALIVE{RESET}" if client_alive else f"{RED}DEAD{RESET}"
+        player_text = (
+            f" Player: {client_name or 'Unknown'}"
+            f"  |  Status: {status}"
+            f"  |  Role: {role}"
+            f"  |  Phase: {ui_phase} (Day {ui_day_num})"
+        )
+        print(box_line(player_text))
+
+        print(mid)
+
+        # --------------------------------------------------------
+        # LOBBY
+        # --------------------------------------------------------
+        print(section_header("LOBBY"))
+
+        if not ui_players:
+            print(box_line("   No players"))
+        else:
+            names = []
+            for player_name, data in ui_players.items():
+                alive = data.get("Alive", True)
+                if alive:
+                    names.append(f"{GREEN}● {player_name}{RESET}")
+                else:
+                    names.append(f"{RED}✕ {player_name}{RESET}")
+
+            # Keep three players per row.
+            for i in range(0, len(names), 3):
+                print(box_line("   " + "   ".join(names[i:i + 3])))
+
+        print(mid)
+
+        # --------------------------------------------------------
+        # CURRENT ROOM
+        # --------------------------------------------------------
+        print(section_header(f"CURRENT ROOM: {ui_current_room}"))
+
+        if ui_current_room == "Lobby":
+            print(box_line("   Lobby — no room tracking needed."))
+        elif ui_room_players is None:
+            print(box_line("   Room occupants: unknown"))
+            print(box_line("   Use /ls to refresh who is currently here."))
+        elif ui_room_players:
+            print(box_line("   Room occupants (last update):"))
+            room_names = []
+            for player_name in ui_room_players:
+                room_names.append(f"{GREEN}● {player_name}{RESET}")
+
+            for i in range(0, len(room_names), 3):
+                print(box_line("   " + "   ".join(room_names[i:i + 3])))
+            print(box_line("   /ls → refresh this list"))
+        else:
+            print(box_line("   Nobody else here (last update)."))
+            print(box_line("   /ls → refresh this list"))
+
+        print(mid)
+
+        # --------------------------------------------------------
+        # TASKS
+        # --------------------------------------------------------
+        print(section_header("TASKS"))
+
+        if not ui_tasks:
+            print(box_line("   No tasks assigned yet."))
+        else:
+            completed_count = sum(
+                1 for task in ui_tasks if task.get("completed", False)
+            )
+
+            print(
+                box_line(
+                    f"   Progress: {completed_count}/{len(ui_tasks)}"
+                )
+            )
+
+            for task in ui_tasks:
+                room = task.get("room", "Unknown")
+                completed = task.get("completed", False)
+
+                if completed:
+                    status = f"{GREEN}✓{RESET}"
+                else:
+                    status = f"{YELLOW}○{RESET}"
+
+                print(box_line(f"   {status} {room}: {TASK_DESCRIPTIONS.get(room, 'Perform the assigned terminal task.')}"))
+
+        print(mid)
+
+        # --------------------------------------------------------
+        # CHAT / EVENTS
+        # --------------------------------------------------------
+        print(section_header("RECENT ACTIVITY"))
+
+        if not ui_chat_log:
+            print(box_line("   Nothing yet."))
+        else:
+            # Keep activity readable: each event is a compact bullet.
+            # Long messages wrap naturally onto following HUD rows.
+            for raw_msg in ui_chat_log[-12:]:
+                clean_msg = strip_ansi(raw_msg).strip()
+                if clean_msg:
+                    print_wrapped_box(clean_msg, indent="   • ")
+
+        print(mid)
+
+        # --------------------------------------------------------
+        # LEAKED AUDIT LOGS
+        # --------------------------------------------------------
+        if ui_audit_leaks:
+            print(section_header("LEAKED AUDIT LOGS"))
+            for line in ui_audit_leaks:
+                print_wrapped_box(line, indent="   ")
+            print(mid)
+
+        # --------------------------------------------------------
+        # COMMAND INPUT
+        # --------------------------------------------------------
+        print(bottom)
+        print(f"{CYAN}> {RESET}", end="", flush=True)
+
+
 # ============================================================
 # HANDLE SERVER MESSAGE (CLIENT-SIDE)
 # ============================================================
 
 def handle_server_message(message, conn=None):
+    """
+    Process exactly one server message.
 
+    IMPORTANT ARCHITECTURE:
+        server message
+            -> update UI state
+            -> optionally add event
+            -> redraw HUD once
+
+    draw_hud() NEVER calls this function.
+    """
     global client_role, client_alive
+    global ui_phase, ui_day_num, ui_current_room
+    global ui_room_players, ui_tasks, ui_players, ui_audit_leaks
+    global active_minigame_process, ui_dirty
 
     message_type = message.get("Type")
+    redraw = True
 
-
-    # --------------------------------------------------------
-    # PLAYER JOINED
-    # --------------------------------------------------------
-
-    if message_type == "Join":
-
-        print(
-            message["Message"]
+    # A server event means the game state changed. If a minigame is running,
+    # immediately stop it so the minigame can never keep the terminal after
+    # a death, game over, phase change, disconnect, etc.
+    # The main client loop will redraw the normal boxed HUD afterwards.
+    if active_minigame_process is not None:
+        stop_active_minigame(
+            f"Server event ({message_type}) received."
         )
 
+    if message_type == "PlayerList":
+        for player_name in message.get("Players", []):
+            ui_players.setdefault(player_name, {"Alive": True})
 
-    # --------------------------------------------------------
-    # PLAYER LEFT
-    # --------------------------------------------------------
+    elif message_type == "RoomInfo":
+        ui_current_room = message.get("Room", ui_current_room)
+        ui_room_players = list(message.get("Players", []))
+
+    elif message_type == "Join":
+        player_name = message.get("Player", "")
+        if player_name:
+            ui_players.setdefault(player_name, {"Alive": True})
+
+        join_message = message.get("Message", f"{player_name} joined.")
+        log_event(f"{GREEN}[+] {join_message}{RESET}")
 
     elif message_type == "Leave":
+        player_name = message.get("Player", "")
+        if player_name in ui_players:
+            del ui_players[player_name]
 
-        print(
-            message["Message"]
+        log_event(
+            f"{RED}[-] {message.get('Message', player_name + ' left.')}{RESET}"
         )
-
-
-    # --------------------------------------------------------
-    # GAME STARTED
-    # --------------------------------------------------------
 
     elif message_type == "GameStart":
-
-        print()
-        print("==============================")
-        print("       GAME HAS STARTED")
-        print("==============================")
-        print()
-
-
-    # --------------------------------------------------------
-    # ROLE ASSIGNMENT
-    # --------------------------------------------------------
+        log_event(f"{CYAN}{BOLD}=== GAME HAS STARTED ==={RESET}")
 
     elif message_type == "RoleAssign":
+        client_role = message.get("Role", "Unknown")
 
-        client_role = message["Role"]
-
-        print()
-        print("==============================")
-        print(f"  YOUR ROLE: {client_role}")
-        print("==============================")
+        log_event(
+            f"{CYAN}{BOLD}--- YOUR ROLE: {client_role} ---{RESET}"
+        )
 
         if client_role == "Process":
-            print("  You are a normal process.")
-            print("  Complete tasks and find the threats.")
-        elif client_role == "Detective":
-            print("  You can inspect audit logs during the day.")
-            print("  Use /inspect <name> during the day.")
+            log_event(
+                f"{CYAN}You are a normal process. Complete tasks and find the threats.{RESET}"
+            )
+        elif client_role == "System Admin":
+            log_event(
+                f"{CYAN}You can inspect audit logs. Use /inspect <name> during the day.{RESET}"
+            )
         elif client_role == "Antivirus":
-            print("  You can revive ONE dead player.")
-            print("  Use /revive <name> during the day.")
+            log_event(
+                f"{CYAN}You can revive ONE dead player. Use /revive <name> during the day.{RESET}"
+            )
         elif client_role == "Virus":
-            print("  You are the killer.")
-            print("  Use /kill <name> during the day.")
+            log_event(
+                f"{RED}You are the killer. Use /kill <name> during the day.{RESET}"
+            )
         elif client_role == "Rootkit":
-            print("  You can tamper with audit logs.")
-            print("  Use /tamper <name> during the day.")
-
-        print("==============================")
-        print()
-
-
-    # --------------------------------------------------------
-    # PHASE CHANGE
-    # --------------------------------------------------------
+            log_event(
+                f"{RED}You can tamper with audit logs. Use /tamper <name> during the day.{RESET}"
+            )
 
     elif message_type == "PhaseChange":
-
-        phase = message["Phase"]
-        day_num = message.get("DayNumber", "")
+        ui_phase = message.get("Phase", ui_phase)
+        ui_day_num = message.get("DayNumber", ui_day_num)
         duration = message.get("Duration", "")
-        
-        global active_minigame_process
-        if active_minigame_process is not None:
-            try:
-                active_minigame_process.terminate()
-            except Exception:
-                pass
-            print("\n[!] The phase has ended. Minigame interrupted!")
-            active_minigame_process = None
 
-        print()
-        print("=" * 40)
+        if ui_phase == "Day":
+            # A new day starts a fresh audit-evidence section.
+            ui_audit_leaks = []
 
-        if phase == "Day":
-            print(f"  ☀  DAY {day_num}  ({duration}s)")
-            print("  Complete your tasks!")
-        elif phase == "Night":
-            print(f"  🌙 NIGHT {day_num}  ({duration}s)")
-            print("  Use your night abilities.")
-        elif phase == "Discussion":
-            print(f"  💬 DISCUSSION  ({duration}s)")
-            print("  Discuss who the threats are.")
-        elif phase == "Voting":
-            print(f"  🗳  VOTING  ({duration}s)")
-            print("  Use /vote <name> to vote.")
+            # All players start the game in Common.
+            if ui_current_room == "Lobby":
+                ui_current_room = "Common"
+                ui_room_players = None
 
-        print("=" * 40)
-        print()
-
-
-    # --------------------------------------------------------
-    # CHAT
-    # --------------------------------------------------------
+            log_event(
+                f"{YELLOW}☀ DAY {ui_day_num} ({duration}s) - Complete your tasks!{RESET}"
+            )
+        elif ui_phase == "Night":
+            log_event(
+                f"{CYAN}NIGHT {ui_day_num} ({duration}s) - Use your night abilities.{RESET}"
+            )
+        elif ui_phase == "Discussion":
+            log_event(
+                f"{CYAN}DISCUSSION ({duration}s) - Discuss who the threats are.{RESET}"
+            )
+        elif ui_phase == "Voting":
+            log_event(
+                f"{YELLOW}VOTING ({duration}s) - Use /vote <name> to vote.{RESET}"
+            )
+        elif ui_phase == "Lobby":
+            log_event(f"{CYAN}[EVENT] Lobby ready.{RESET}")
 
     elif message_type == "Chat":
+        player = message.get("Player", "")
+        msg = message.get("Message", "")
 
-        print(
-            f'{message["Player"]}: '
-            f'{message["Message"]}'
-        )
+        if player == "SYSTEM":
+            # RoomInfo is now enough to update the room section.
+            # Ignore the old multi-line room-info text if an older
+            # server still sends it.
+            ignored = {
+                "--- ROOM INFO ---",
+                "-----------------",
+            }
 
+            for line in msg.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
 
-    # --------------------------------------------------------
-    # WHISPER RECEIVED
-    # --------------------------------------------------------
+                if line in ignored:
+                    continue
+
+                if (
+                    line.startswith("You are in:")
+                    or line.startswith("Other players here:")
+                    or line.startswith("Available rooms:")
+                ):
+                    continue
+
+                log_event(f"{CYAN}[EVENT] {line}{RESET}")
+        else:
+            log_event(f"{BOLD}{player} ›{RESET} {msg}")
 
     elif message_type == "Whisper":
-
-        print(
-            f'[Whisper from {message["Player"]}] '
-            f'{message["Message"]}'
-        )
-
-
-    # --------------------------------------------------------
-    # WHISPER SENT
-    # --------------------------------------------------------
+        player = message.get("Player", "")
+        msg = message.get("Message", "")
+        log_event(f"{YELLOW}[WHISPER] {player} → You{RESET}")
+        log_event(f"{YELLOW}> {msg}{RESET}")
 
     elif message_type == "WhisperSent":
-
-        print(
-            f'[Whisper to {message["Player"]}] '
-            f'{message["Message"]}'
-        )
-
-
-    # --------------------------------------------------------
-    # ERROR
-    # --------------------------------------------------------
+        player = message.get("Player", "")
+        msg = message.get("Message", "")
+        log_event(f"{YELLOW}[WHISPER] You → {player}{RESET}")
+        log_event(f"{YELLOW}> {msg}{RESET}")
 
     elif message_type == "Error":
-
-        print(
-            f'[ERROR] {message["Message"]}'
+        log_event(
+            f"{RED}[ERROR] {message.get('Message', 'Unknown error')}{RESET}"
         )
 
-
-    # --------------------------------------------------------
-    # TASK ASSIGNMENT
-    # --------------------------------------------------------
-
     elif message_type == "TaskAssign":
+        tasks_list = message.get("Tasks", [])
 
-        tasks = message.get("Tasks", [])
+        # Keep one consistent internal representation.
+        ui_tasks = [
+            {
+                "room": room,
+                "completed": False
+            }
+            for room in tasks_list
+        ]
 
-        print()
-        print("--- TASKS ASSIGNED ---")
-
-        for i, room in enumerate(tasks, 1):
-            print(f"  {i}. Go to {room} and complete the task")
-
-        print("  Use /move to go to a room, then /task")
-        print("----------------------")
-        print()
-
-
-    # --------------------------------------------------------
-    # TASK START (launch minigame)
-    # --------------------------------------------------------
+        log_event(f"{GREEN}[+] TASKS ASSIGNED{RESET}")
 
     elif message_type == "TaskStart":
-
         minigame = message.get("Minigame", "")
         room = message.get("Room", "")
 
         def run_task():
-            global active_minigame_process
-            print(f"\n--- Starting task: {minigame} ---\n")
+            global active_minigame_process, minigame_cancelled
+
+            minigame_cancelled = False
+            clear_terminal()
+            print(
+                f"{CYAN}--- Starting task: {minigame} ---{RESET}\n",
+                flush=True
+            )
+
             success = False
+
             try:
-                cmd = f"from {minigame} import play_{minigame}; import sys; sys.exit(0 if play_{minigame}() else 1)"
-                proc = subprocess.Popen(["python3", "-c", cmd])
+                cmd = (
+                    f"from {minigame} import play_{minigame}; "
+                    f"import sys; "
+                    f"sys.exit(0 if play_{minigame}() else 1)"
+                )
+
+                proc = subprocess.Popen(
+                    ["python3", "-c", cmd]
+                )
                 active_minigame_process = proc
+
                 proc.wait()
-                success = (proc.returncode == 0)
+                success = proc.returncode == 0
+
             except Exception as e:
                 print(f"Minigame error: {e}")
                 success = False
+
             finally:
                 active_minigame_process = None
 
-            if conn is not None:
-                send_message(conn, {
-                    "Type": "TaskResult",
-                    "Room": room,
-                    "Success": success,
-                })
-                print("\n> ", end="", flush=True)
+            # If the minigame was interrupted by a server event, do not send
+            # a stale success/failure result back to the server.
+            was_cancelled = minigame_cancelled
+            ui_dirty = True
 
-        threading.Thread(target=run_task, daemon=True).start()
+            if conn is not None and not was_cancelled:
+                send_message(
+                    conn,
+                    {
+                        "Type": "TaskResult",
+                        "Room": room,
+                        "Success": success,
+                    }
+                )
 
+        threading.Thread(
+            target=run_task,
+            daemon=True
+        ).start()
 
-    # --------------------------------------------------------
-    # TASK COMPLETE
-    # --------------------------------------------------------
+        # The minigame thread owns the terminal now.
+        redraw = False
 
     elif message_type == "TaskComplete":
-
         room = message.get("Room", "")
         remaining = message.get("Remaining", 0)
 
-        print(f"\n✓ Task in {room} completed!")
+        for task in ui_tasks:
+            if task.get("room") == room and not task.get("completed", False):
+                task["completed"] = True
+                break
 
-        if remaining > 0:
-            print(f"  {remaining} task(s) remaining.")
-        else:
-            print("  All tasks complete!")
+        log_event(f"{GREEN}✓ Task in {room} completed!{RESET}")
 
-        print()
-
-
-    # --------------------------------------------------------
-    # TASK LIST
-    # --------------------------------------------------------
+        if remaining == 0:
+            log_event(f"{GREEN}All tasks complete!{RESET}")
 
     elif message_type == "TaskList":
+        tasks_list = message.get("Tasks", [])
+        completed_count = message.get("Completed", 0)
 
-        tasks = message.get("Tasks", [])
-        completed = message.get("Completed", 0)
-        required = message.get("Required", TASKS_PER_DAY)
+        # Sync task names without inventing completion details.
+        if tasks_list:
+            ui_tasks = [
+                {
+                    "room": room,
+                    "completed": False
+                }
+                for room in tasks_list
+            ]
 
-        print()
-        print(f"--- TASKS ({completed}/{required} done) ---")
-
-        if tasks:
-            for i, room in enumerate(tasks, 1):
-                print(f"  {i}. {room} (pending)")
-        else:
-            print("  All tasks complete!")
-
-        print("----------------------------")
-        print()
-
-
-    # --------------------------------------------------------
-    # KILL MINIGAME
-    # --------------------------------------------------------
+        log_event(
+            f"{CYAN}Tasks: {completed_count} completed.{RESET}"
+        )
 
     elif message_type == "KillMinigame":
-
         target_name = message.get("Target", "")
 
         def run_kill():
-            global active_minigame_process
-            print(f"\n--- Attempting to kill {target_name} ---\n")
+            global active_minigame_process, minigame_cancelled
+
+            minigame_cancelled = False
+            clear_terminal()
+            print(
+                f"{RED}--- Attempting to kill {target_name} ---{RESET}\n",
+                flush=True
+            )
+
             success = False
+
             try:
-                cmd = "from kill_minigame import kill_minigame; import sys; sys.exit(0 if kill_minigame() else 1)"
-                proc = subprocess.Popen(["python3", "-c", cmd])
+                cmd = (
+                    "from kill_minigame import kill_minigame; "
+                    "import sys; "
+                    "sys.exit(0 if kill_minigame() else 1)"
+                )
+
+                proc = subprocess.Popen(
+                    ["python3", "-c", cmd]
+                )
                 active_minigame_process = proc
+
                 proc.wait()
-                success = (proc.returncode == 0)
+                success = proc.returncode == 0
+
             except Exception as e:
                 print(f"Kill minigame error: {e}")
                 success = False
+
             finally:
                 active_minigame_process = None
 
-            if conn is not None:
-                send_message(conn, {
-                    "Type": "KillResult",
-                    "Target": target_name,
-                    "Success": success,
-                })
-                print("\n> ", end="", flush=True)
+            # If a death/game-over/other server event interrupted the kill,
+            # never report the old minigame result.
+            was_cancelled = minigame_cancelled
+            ui_dirty = True
 
-        threading.Thread(target=run_kill, daemon=True).start()
+            if conn is not None and not was_cancelled:
+                send_message(
+                    conn,
+                    {
+                        "Type": "KillResult",
+                        "Target": target_name,
+                        "Success": success,
+                    }
+                )
 
+        threading.Thread(
+            target=run_kill,
+            daemon=True
+        ).start()
 
-    # --------------------------------------------------------
-    # DEATH ANNOUNCEMENT
-    # --------------------------------------------------------
+        redraw = False
 
     elif message_type == "Death":
-
         player_name = message.get("Player", "")
         msg = message.get("Message", "")
 
+        if player_name in ui_players:
+            ui_players[player_name]["Alive"] = False
+
         if player_name == client_name:
-            print()
-            print("\033[91m\033[1m" + "☠" * 40)
-            print(" " * 12 + "YOU ARE DEAD!")
-            print(" " * 12 + "Your process was terminated.")
-            print(" " * 12 + "You can no longer talk or act.")
-            print("☠" * 40 + "\033[0m")
-            print()
+            client_alive = False
+            log_event(
+                f"{RED}{BOLD}YOU ARE DEAD! Your process was terminated.{RESET}"
+            )
         else:
-            print()
-            print("☠" * 20)
-            print(f"  {msg}")
-            print("☠" * 20)
-            print()
-
-
-    # --------------------------------------------------------
-    # AUDIT LOG (Detective inspection result)
-    # --------------------------------------------------------
+            log_event(f"{RED}[DEATH] {msg}{RESET}")
 
     elif message_type == "AuditLog":
-
         target = message.get("Target", "")
-        log = message.get("Log", [])
+        log_list = message.get("Log", [])
 
-        print()
-        print(f"--- AUDIT LOG: {target} ---")
+        log_event(f"{CYAN}[AUDIT LOG] {target}{RESET}")
 
-        if log:
-            for entry in log:
-                print(
-                    f"  {entry['Timestamp']}  {entry['Room']}"
-                )
+        if not log_list:
+            log_event("  No entries.")
         else:
-            print("  No entries.")
-
-        print("---------------------------")
-        print()
-
-
-    # --------------------------------------------------------
-    # AUDIT LEAK (dead player's log)
-    # --------------------------------------------------------
+            for entry in log_list:
+                timestamp = entry.get("Timestamp", "")
+                room = entry.get("Room", "")
+                if entry.get("Type") == "ACTION":
+                    log_event(
+                        f"  {timestamp}  Performed an action in {room}."
+                    )
+                else:
+                    log_event(
+                        f"  {timestamp}  Moved to {room}."
+                    )
 
     elif message_type == "AuditLeak":
-
         player_name = message.get("Player", "")
-        log = message.get("Log", [])
+        log_list = message.get("Log", [])
 
-        print()
-        print(f"--- AUDIT LEAK: {player_name} (deceased) ---")
+        # Keep leaked audits in their own HUD section so the normal event
+        # history cannot push the evidence off-screen.
+        if not ui_audit_leaks:
+            ui_audit_leaks.append(
+                f"{CYAN}[AUDIT LEAKS] Evidence from this discussion{RESET}"
+            )
 
-        if log:
-            for entry in log:
-                print(
-                    f"  {entry['Timestamp']}  {entry['Room']}"
-                )
+        ui_audit_leaks.append(
+            f"{CYAN}{player_name} (deceased){RESET}"
+        )
+
+        if not log_list:
+            ui_audit_leaks.append("  No entries.")
         else:
-            print("  No entries.")
+            for entry in log_list:
+                timestamp = entry.get("Timestamp", "")
+                room = entry.get("Room", "")
+                if entry.get("Type") == "ACTION":
+                    ui_audit_leaks.append(
+                        f"  {timestamp}  Performed an action in {room}."
+                    )
+                else:
+                    ui_audit_leaks.append(
+                        f"  {timestamp}  Moved to {room}."
+                    )
 
-        print("--------------------------------------------")
-        print()
-
-
-    # --------------------------------------------------------
-    # TAMPER PROMPT (Rootkit sees target's audit log)
-    # --------------------------------------------------------
+        log_event(
+            f"{CYAN}[AUDIT] {player_name}'s audit log leaked.{RESET}"
+        )
 
     elif message_type == "TamperPrompt":
-
         target = message.get("Target", "")
-        log = message.get("Log", [])
+        log_list = message.get("Log", [])
 
-        print()
-        print(f"--- TAMPER: {target}'s audit log ---")
+        log_event(f"{RED}[TAMPER] {target}'s audit log{RESET}")
 
-        if log:
-            for i, entry in enumerate(log):
-                print(
-                    f"  [{i + 1}] {entry['Timestamp']}  "
-                    f"{entry['Room']}"
-                )
+        if not log_list:
+            log_event("  No entries.")
         else:
-            print("  No entries.")
+            for i, entry in enumerate(log_list):
+                log_event(
+                    f"  [{i + 1}] {entry.get('Timestamp', '')}  "
+                    f"{entry.get('Room', '')}"
+                )
 
-        print()
-        print("Tamper Options (Type these directly into chat):")
-        print(f"  /tamperedit {target} <index> <new_room>")
-        print(f"  /tamperadd {target} <new_room> <HH:MM:SS>")
-        print("------------------")
-        print("> ", end="", flush=True)
-
-
-    # --------------------------------------------------------
-    # VOTE RESULT
-    # --------------------------------------------------------
+        log_event(
+            f"{RED}Use /tamperedit or /tamperadd for the requested change.{RESET}"
+        )
 
     elif message_type == "VoteResult":
-
         eliminated = message.get("Eliminated")
         msg = message.get("Message", "")
 
-        print()
-
         if eliminated:
-            print("🗳" * 20)
-            print(f"  {msg}")
-            print("🗳" * 20)
+            log_event(f"{RED}[VOTE] {msg}{RESET}")
         else:
-            print(f"  {msg}")
+            log_event(f"{YELLOW}[VOTE] {msg}{RESET}")
 
-        print()
-
-
-    # --------------------------------------------------------
-    # GAME OVER
-    # --------------------------------------------------------
+        if eliminated in ui_players:
+            ui_players[eliminated]["Alive"] = False
 
     elif message_type == "GameOver":
-
-        winner = message.get("Winner", "")
+        ui_phase = "GameOver"
         msg = message.get("Message", "")
         roles = message.get("Roles", "")
 
-        print()
-        print("=" * 50)
-        print("  GAME OVER")
-        print(f"  {msg}")
-        print()
-        print("  --- Role Reveal ---")
-        print(roles)
-        print("=" * 50)
-        print()
+        log_event(f"{CYAN}{BOLD}=== GAME OVER ==={RESET}")
+        log_event(f"{CYAN}{msg}{RESET}")
+
+        for line in roles.splitlines():
+            if line.strip():
+                log_event(f"{CYAN}{line.strip()}{RESET}")
+
+    else:
+        # Unknown messages should not crash the HUD.
+        redraw = False
+
+    if redraw:
+        ui_dirty = True
 
 
 # ============================================================
@@ -2779,20 +3291,34 @@ def send_move_message(conn,message):
 
 def client_game_loop(conn):
 
+    global ui_dirty
+
+    # Put the HUD on its own terminal screen so previous HUD frames
+    # can never remain visible underneath the current one.
+    enter_hud_screen()
+
+    # Initial draw when loop starts
+    draw_hud()
+    ui_dirty = False
+
     while True:
 
         message = ""
-        print("> ", end="", flush=True)
         while True:
             if active_minigame_process is not None:
                 while active_minigame_process is not None:
                     time.sleep(0.1)
-                print("\n> ", end="", flush=True)
+                ui_dirty = True
                 
+            if ui_dirty and active_minigame_process is None:
+                draw_hud()
+                ui_dirty = False
+
             r, _, _ = select.select([sys.stdin], [], [], 0.1)
             if r:
                 line = sys.stdin.readline()
                 if not line:
+                    exit_hud_screen()
                     return # EOF
                 message = line
                 break
@@ -2803,6 +3329,7 @@ def client_game_loop(conn):
 
         if message.strip() == "/quit":
 
+            exit_hud_screen()
             break
 
 
@@ -2811,6 +3338,7 @@ def client_game_loop(conn):
         # ====================================================
 
         if message.strip() == "":
+            ui_dirty = True
             continue
 
         message = message.strip()
@@ -2961,7 +3489,7 @@ def client_game_loop(conn):
 
 
         # ====================================================
-        # INSPECT (Detective)
+        # INSPECT (System Admin)
         # ====================================================
 
         elif message.startswith("/inspect"):
@@ -3050,24 +3578,22 @@ def client_game_loop(conn):
 
         elif message == "/help":
 
-            print()
-            print("=== COMMANDS ===")
-            print("  /ls            — List current room and players here")
-            print("  /move          — Move to a room")
-            print("  /task          — Do your task in current room")
-            print("  /tasks         — View your assigned tasks")
-            print("  /whisper       — Send a private message")
-            print("  /chat <msg>    — Send a public message")
-            print("  /vote <name>   — Vote to eliminate a player")
-            print("  /kill <name>   — [Virus] Kill a player (day)")
-            print("  /inspect <name>— [Detective] Inspect audit (day)")
-            print("  /revive <name> — [Antivirus] Revive a player (day)")
-            print("  /tamper <name> — [Rootkit] Tamper audit log (day)")
-            print("  /sabotage <name> — [Bad team] Jumble messages (day)")
-            print("  /help          — Show this help")
-            print("  /quit          — Leave the game")
-            print("================")
-            print()
+            log_event(f"{CYAN}{BOLD}COMMANDS{RESET}")
+            log_event("/ls — current room and players")
+            log_event("/move — move to a room")
+            log_event("/task — do your task")
+            log_event("/tasks — view tasks")
+            log_event("/whisper — private message")
+            log_event("/chat <msg> — public message")
+            log_event("/vote <name> — vote")
+            log_event("/kill <name> — Virus")
+            log_event("/inspect <name> — System Admin")
+            log_event("/revive <name> — Antivirus")
+            log_event("/tamper <name> — Rootkit")
+            log_event("/sabotage <name> — bad team")
+            log_event("/help — show commands")
+            log_event("/quit — leave")
+            ui_dirty = True
 
 
         # ====================================================
@@ -3079,11 +3605,19 @@ def client_game_loop(conn):
             if chat_msg:
                 send_chat(conn, chat_msg)
 
+        elif message.startswith("/start") or message.lower().strip() == "start game":
+            send_message(conn, {"Type": "StartGame"})
+
         elif message.startswith("/"):
-            print("Unknown command. Type /help for a list of commands.")
+            log_event(f"{RED}[ERROR] Unknown command. Type /help for a list of commands.{RESET}")
+            ui_dirty = True
 
         else:
-            print("Please use a command (e.g., /chat <message> to talk). Type /help for a list of commands.")
+            # If not a command and in Lobby or game active, try sending as chat
+            if ui_phase == "Lobby":
+                send_chat(conn, message)
+            else:
+                print("Please use a command (e.g., /chat <message> to talk). Type /help for a list of commands.")
 
 
     try:
@@ -3099,9 +3633,23 @@ def client_game_loop(conn):
 def client_game(conn, name):
 
     global client_conn, client_name
+    global client_role, client_alive
+    global ui_players, ui_current_room, ui_room_players
+    global ui_tasks, ui_chat_log, ui_phase, ui_day_num
 
     client_conn = conn
     client_name = name
+
+    # Start this client with a clean UI state.
+    client_role = None
+    client_alive = True
+    ui_players = {}
+    ui_current_room = "Lobby"
+    ui_room_players = None
+    ui_tasks = []
+    ui_chat_log = []
+    ui_phase = "Lobby"
+    ui_day_num = 0
 
     # ========================================================
     # TELL SERVER WHO WE ARE
