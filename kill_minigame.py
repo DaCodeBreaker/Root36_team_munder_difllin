@@ -79,8 +79,8 @@ def kill_minigame():
 
         os.system("clear")
 
-    print("=== KILL ===")
-    print()
+        print("=== KILL ===")
+        print()
         print(message)
 
         time.sleep(1)
