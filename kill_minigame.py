@@ -61,12 +61,16 @@ def get_key(timeout):
         )
 
 
+def draw_header():
+    sys.stdout.write("\033[2J\033[H")
+    print("╔══════════════════════════════════╗")
+    print("║          KILL MINIGAME           ║")
+    print("╠══════════════════════════════════╣")
+    print()
+
 def kill_minigame():
 
-    os.system("clear")
-
-    print("=== KILL ===")
-    print()
+    draw_header()
 
     # Shuffle the messages so they appear in random order
     messages = MESSAGES.copy()
@@ -77,10 +81,7 @@ def kill_minigame():
 
     for message in messages[:num_messages]:
 
-        os.system("clear")
-
-        print("=== KILL ===")
-        print()
+        draw_header()
         print(message)
 
         time.sleep(1)
@@ -89,18 +90,15 @@ def kill_minigame():
     correct_key = random.choice(list(KEYS.keys()))
     key_name = KEYS[correct_key]
 
-    os.system("clear")
-
-    print("=== KILL ===")
-    print()
+    draw_header()
     print(f"PRESS [{key_name}] NOW!")
 
     # Fixed response time
-    time_limit = 1.5
+    time_limit = 2.0
 
     pressed_key = get_key(time_limit)
 
-    os.system("clear")
+    draw_header()
 
     if pressed_key == correct_key:
 
